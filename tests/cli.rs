@@ -284,3 +284,49 @@ fn workspace_mutations_are_detected_from_before_after_git_snapshots() -> Result<
 
     Ok(())
 }
+
+#[test]
+fn verify_passes_for_intact_trace_and_fails_after_tampering() -> Result<()> {
+    let temp = TempDir::new()?;
+
+    let mut run = Command::cargo_bin("tracebox")?;
+
+    run.current_dir(temp.path())
+        .args(["run", "--", "sh", "-c", "printf verified"]);
+
+    run.assert().success();
+
+    let trace_dir = single_trace_dir(temp.path())?;
+
+    let trace_id = trace_dir
+        .file_name()
+        .context("trace directory should have a file name")?
+        .to_string_lossy()
+        .to_string();
+
+    let mut verify = Command::cargo_bin("tracebox")?;
+
+    verify
+        .current_dir(temp.path())
+        .args(["verify", &trace_id])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Status: OK"))
+        .stdout(predicate::str::contains("manifest.json: OK"))
+        .stdout(predicate::str::contains("stdout.log: OK"))
+        .stdout(predicate::str::contains("stderr.log: OK"));
+
+    fs::write(trace_dir.join("stdout.log"), "tampered\n")?;
+
+    let mut verify_after_tamper = Command::cargo_bin("tracebox")?;
+
+    verify_after_tamper
+        .current_dir(temp.path())
+        .args(["verify", &trace_id])
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains("Status: FAILED"))
+        .stdout(predicate::str::contains("stdout.log: FAILED"));
+
+    Ok(())
+}
