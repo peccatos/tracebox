@@ -2,6 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use serde_json::json;
 
 use crate::evidence::store::{FilesystemTraceStore, TraceStoreConfig};
 
@@ -11,10 +12,62 @@ pub fn execute(
     show_stdout: bool,
     show_stderr: bool,
     tail: usize,
+    json_output: bool,
 ) -> Result<()> {
     let store = FilesystemTraceStore::new(TraceStoreConfig::new(&trace_root));
     let paths = store.paths_for(&trace_id);
     let manifest = store.load_manifest(&trace_id)?;
+
+    let should_show_stderr_by_default =
+        !show_stdout && !show_stderr && file_nonempty(&paths.stderr);
+
+    if json_output {
+        let stdout_tail = if show_stdout {
+            Some(tail_lines("stdout", &paths.stdout, tail)?)
+        } else {
+            None
+        };
+
+        let stderr_tail = if show_stderr || should_show_stderr_by_default {
+            Some(tail_lines("stderr", &paths.stderr, tail)?)
+        } else {
+            None
+        };
+
+        let pty_json = match &manifest.artifacts.pty {
+            Some(pty) => {
+                let path = paths.root.join(pty);
+                Some(json!({
+                    "path": path.display().to_string(),
+                    "size_bytes": artifact_size(&path)?,
+                    "sha256": manifest.integrity.pty_sha256,
+                }))
+            }
+            None => None,
+        };
+
+        let output = json!({
+            "trace": manifest,
+            "trace_path": paths.root.display().to_string(),
+            "artifacts": {
+                "stdout": {
+                    "path": paths.stdout.display().to_string(),
+                    "size_bytes": artifact_size(&paths.stdout)?,
+                },
+                "stderr": {
+                    "path": paths.stderr.display().to_string(),
+                    "size_bytes": artifact_size(&paths.stderr)?,
+                },
+                "pty": pty_json,
+            },
+            "manifest_sha256": read_optional_trimmed(&paths.manifest_sha256)?,
+            "stdout_tail": stdout_tail,
+            "stderr_tail": stderr_tail,
+        });
+
+        println!("{}", serde_json::to_string_pretty(&output)?);
+        return Ok(());
+    }
 
     println!("Trace ID: {}", manifest.trace_id);
 
@@ -70,11 +123,8 @@ pub fn execute(
     );
 
     if let Some(pty) = &manifest.artifacts.pty {
-        println!(
-            "  pty: {} ({})",
-            paths.root.join(pty).display(),
-            artifact_summary(&paths.root.join(pty))?
-        );
+        let path = paths.root.join(pty);
+        println!("  pty: {} ({})", path.display(), artifact_summary(&path)?);
     }
 
     println!();
@@ -86,14 +136,9 @@ pub fn execute(
         println!("  pty_sha256: {pty_hash}");
     }
 
-    if paths.manifest_sha256.exists() {
-        let hash = fs::read_to_string(&paths.manifest_sha256)
-            .with_context(|| format!("failed to read {}", paths.manifest_sha256.display()))?;
-        println!("  manifest_sha256: {}", hash.trim());
+    if let Some(hash) = read_optional_trimmed(&paths.manifest_sha256)? {
+        println!("  manifest_sha256: {hash}");
     }
-
-    let should_show_stderr_by_default =
-        !show_stdout && !show_stderr && file_nonempty(&paths.stderr);
 
     if show_stdout {
         print_tail("stdout", &paths.stdout, tail)?;
@@ -121,7 +166,6 @@ fn print_file_list(label: &str, files: &[String]) {
         println!("{label}: -");
     } else {
         println!("{label}:");
-
         for file in files {
             println!("    - {file}");
         }
@@ -129,11 +173,13 @@ fn print_file_list(label: &str, files: &[String]) {
 }
 
 fn artifact_summary(path: &Path) -> Result<String> {
-    let bytes = fs::metadata(path)
-        .with_context(|| format!("failed to stat {}", path.display()))?
-        .len();
+    Ok(format!("{} bytes", artifact_size(path)?))
+}
 
-    Ok(format!("{bytes} bytes"))
+fn artifact_size(path: &Path) -> Result<u64> {
+    Ok(fs::metadata(path)
+        .with_context(|| format!("failed to stat {}", path.display()))?
+        .len())
 }
 
 fn file_nonempty(path: &Path) -> bool {
@@ -142,12 +188,29 @@ fn file_nonempty(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn print_tail(label: &str, path: &Path, lines: usize) -> Result<()> {
-    let text = fs::read_to_string(path)
-        .with_context(|| format!("failed to read {} artifact {}", label, path.display()))?;
+fn read_optional_trimmed(path: &Path) -> Result<Option<String>> {
+    if !path.exists() {
+        return Ok(None);
+    }
 
-    let collected = text.lines().collect::<Vec<_>>();
+    let text =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+
+    Ok(Some(text.trim().to_string()))
+}
+
+fn tail_lines(label: &str, path: &Path, lines: usize) -> Result<Vec<String>> {
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("failed to read {label} artifact {}", path.display()))?;
+
+    let collected = text.lines().map(ToOwned::to_owned).collect::<Vec<_>>();
     let start = collected.len().saturating_sub(lines);
+
+    Ok(collected[start..].to_vec())
+}
+
+fn print_tail(label: &str, path: &Path, lines: usize) -> Result<()> {
+    let collected = tail_lines(label, path, lines)?;
 
     println!();
     println!("{label} tail (last {lines} lines):");
@@ -157,7 +220,7 @@ fn print_tail(label: &str, path: &Path, lines: usize) -> Result<()> {
         return Ok(());
     }
 
-    for line in &collected[start..] {
+    for line in collected {
         println!("{line}");
     }
 

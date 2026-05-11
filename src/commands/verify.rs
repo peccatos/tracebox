@@ -2,6 +2,7 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::Result;
+use serde::Serialize;
 
 use crate::evidence::integrity::sha256_file;
 use crate::evidence::manifest::TraceManifest;
@@ -18,40 +19,40 @@ use crate::evidence::store::{FilesystemTraceStore, TraceStoreConfig};
 /// - `0`: verification passed;
 /// - `1`: trace exists but verification failed;
 /// - `2`: trace is missing or structurally invalid.
-pub fn execute(trace_root: PathBuf, trace_id: String) -> Result<i32> {
+pub fn execute(trace_root: PathBuf, trace_id: String, json_output: bool) -> Result<i32> {
     let store = FilesystemTraceStore::new(TraceStoreConfig::new(&trace_root));
     let paths = store.paths_for(&trace_id);
 
-    println!("Trace ID: {trace_id}");
-    println!("Trace path: {}", paths.root.display());
-
     if !paths.root.is_dir() {
-        println!("Status: INVALID");
-        println!();
-        println!("Reason:");
-        println!("  trace directory does not exist");
-        return Ok(2);
+        return finish_invalid(
+            json_output,
+            &trace_id,
+            &paths.root,
+            "trace directory does not exist",
+        );
     }
 
     let manifest_json = match fs::read_to_string(&paths.manifest) {
         Ok(json) => json,
         Err(error) => {
-            println!("Status: INVALID");
-            println!();
-            println!("Reason:");
-            println!("  failed to read {}: {error}", paths.manifest.display());
-            return Ok(2);
+            return finish_invalid(
+                json_output,
+                &trace_id,
+                &paths.root,
+                &format!("failed to read {}: {error}", paths.manifest.display()),
+            );
         }
     };
 
     let manifest: TraceManifest = match serde_json::from_str(&manifest_json) {
         Ok(manifest) => manifest,
         Err(error) => {
-            println!("Status: INVALID");
-            println!();
-            println!("Reason:");
-            println!("  failed to parse {}: {error}", paths.manifest.display());
-            return Ok(2);
+            return finish_invalid(
+                json_output,
+                &trace_id,
+                &paths.root,
+                &format!("failed to parse {}: {error}", paths.manifest.display()),
+            );
         }
     };
 
@@ -79,17 +80,32 @@ pub fn execute(trace_root: PathBuf, trace_id: String) -> Result<i32> {
 
     let all_ok = checks.iter().all(VerificationCheck::is_ok);
 
-    if all_ok {
-        println!("Status: OK");
+    if json_output {
+        let report = VerificationReport {
+            trace_id,
+            trace_path: paths.root.display().to_string(),
+            status: if all_ok { "OK" } else { "FAILED" },
+            reason: None,
+            checks: checks.iter().map(VerificationCheck::to_json).collect(),
+        };
+
+        println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
-        println!("Status: FAILED");
-    }
+        println!("Trace ID: {trace_id}");
+        println!("Trace path: {}", paths.root.display());
 
-    println!();
-    println!("Checks:");
+        if all_ok {
+            println!("Status: OK");
+        } else {
+            println!("Status: FAILED");
+        }
 
-    for check in &checks {
-        print_check(check);
+        println!();
+        println!("Checks:");
+
+        for check in &checks {
+            print_check(check);
+        }
     }
 
     if all_ok {
@@ -97,6 +113,25 @@ pub fn execute(trace_root: PathBuf, trace_id: String) -> Result<i32> {
     } else {
         Ok(1)
     }
+}
+
+#[derive(Debug, Serialize)]
+struct VerificationReport {
+    trace_id: String,
+    trace_path: String,
+    status: &'static str,
+    reason: Option<String>,
+    checks: Vec<JsonVerificationCheck>,
+}
+
+#[derive(Debug, Serialize)]
+struct JsonVerificationCheck {
+    label: String,
+    path: Option<String>,
+    status: String,
+    expected: Option<String>,
+    actual: Option<String>,
+    detail: Option<String>,
 }
 
 #[derive(Debug)]
@@ -167,6 +202,17 @@ impl VerificationCheck {
     fn is_ok(&self) -> bool {
         matches!(self.status, CheckStatus::Ok)
     }
+
+    fn to_json(&self) -> JsonVerificationCheck {
+        JsonVerificationCheck {
+            label: self.label.clone(),
+            path: self.path.as_ref().map(|path| path.display().to_string()),
+            status: self.status.as_str().to_string(),
+            expected: self.expected.clone(),
+            actual: self.actual.clone(),
+            detail: self.detail.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -186,6 +232,34 @@ impl CheckStatus {
             CheckStatus::Invalid => "INVALID",
         }
     }
+}
+
+fn finish_invalid(
+    json_output: bool,
+    trace_id: &str,
+    trace_path: &Path,
+    reason: &str,
+) -> Result<i32> {
+    if json_output {
+        let report = VerificationReport {
+            trace_id: trace_id.to_string(),
+            trace_path: trace_path.display().to_string(),
+            status: "INVALID",
+            reason: Some(reason.to_string()),
+            checks: Vec::new(),
+        };
+
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("Trace ID: {trace_id}");
+        println!("Trace path: {}", trace_path.display());
+        println!("Status: INVALID");
+        println!();
+        println!("Reason:");
+        println!("  {reason}");
+    }
+
+    Ok(2)
 }
 
 fn verify_manifest_sidecar(checks: &mut Vec<VerificationCheck>, manifest: &Path, sidecar: &Path) {

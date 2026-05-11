@@ -26,12 +26,20 @@ fn main() -> Result<()> {
             stdout,
             stderr,
             tail,
+            json,
         } => {
-            tracebox::commands::inspect::execute(cli.trace_root, trace_id, stdout, stderr, tail)?;
+            tracebox::commands::inspect::execute(
+                cli.trace_root,
+                trace_id,
+                stdout,
+                stderr,
+                tail,
+                json,
+            )?;
         }
 
-        Commands::Verify { trace_id } => {
-            let exit_code = tracebox::commands::verify::execute(cli.trace_root, trace_id)?;
+        Commands::Verify { trace_id, json } => {
+            let exit_code = tracebox::commands::verify::execute(cli.trace_root, trace_id, json)?;
             std::process::exit(exit_code);
         }
 
@@ -39,8 +47,8 @@ fn main() -> Result<()> {
             tracebox::commands::list::execute(cli.trace_root, json)?;
         }
 
-        Commands::Diff { left, right } => {
-            tracebox::commands::diff::execute(cli.trace_root, left, right)?;
+        Commands::Diff { left, right, json } => {
+            tracebox::commands::diff::execute(cli.trace_root, left, right, json)?;
         }
     }
 
