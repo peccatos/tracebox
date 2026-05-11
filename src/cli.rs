@@ -63,6 +63,12 @@ pub enum Commands {
         tail: usize,
     },
 
+    /// Verify trace artifact integrity.
+    Verify {
+        /// Trace ID, for example `trc_019...`.
+        trace_id: String,
+    },
+
     /// List available traces.
     List {
         /// Emit JSON instead of a human table.

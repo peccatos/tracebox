@@ -30,6 +30,11 @@ fn main() -> Result<()> {
             tracebox::commands::inspect::execute(cli.trace_root, trace_id, stdout, stderr, tail)?;
         }
 
+        Commands::Verify { trace_id } => {
+            let exit_code = tracebox::commands::verify::execute(cli.trace_root, trace_id)?;
+            std::process::exit(exit_code);
+        }
+
         Commands::List { json } => {
             tracebox::commands::list::execute(cli.trace_root, json)?;
         }
