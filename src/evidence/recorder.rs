@@ -73,6 +73,7 @@ struct InProgressTrace {
     saw_pty_output: bool,
     started_at: chrono::DateTime<Utc>,
     before: WorkspaceSnapshot,
+    workspace_ignored_path_prefixes: Vec<String>,
 }
 
 impl FilesystemEvidenceRecorder {
@@ -95,15 +96,20 @@ impl FilesystemEvidenceRecorder {
 impl EvidenceRecorder for FilesystemEvidenceRecorder {
     fn tool_started(&self, event: ToolStarted) -> Result<ToolTraceHandle> {
         let trace_id = generate_trace_id();
+
+        let workspace_ignored_path_prefixes =
+            workspace_ignored_path_prefixes(&event.cwd, self.store.root());
+
+        // Snapshot must happen before trace directory creation. Otherwise `.traces`
+        // itself makes a clean git workspace look dirty.
+        let before = capture_workspace_snapshot(&event.cwd, &workspace_ignored_path_prefixes);
+
         let paths = self.store.create_trace_dir(&trace_id)?;
 
         let stdout = FilesystemTraceStore::create_artifact(&paths.stdout)?;
         let stderr = FilesystemTraceStore::create_artifact(&paths.stderr)?;
         let pty = FilesystemTraceStore::create_artifact(&paths.pty)?;
 
-        // Snapshot before execution, not after. A single post-run git status is
-        // not evidence of what the process changed.
-        let before = capture_workspace_snapshot(&event.cwd);
         let started_at = Utc::now();
 
         let in_progress = InProgressTrace {
@@ -115,6 +121,7 @@ impl EvidenceRecorder for FilesystemEvidenceRecorder {
             saw_pty_output: false,
             started_at,
             before,
+            workspace_ignored_path_prefixes,
         };
 
         let mut state = self
@@ -204,7 +211,8 @@ fn finish_trace(
     drop(trace.pty);
 
     let finished_at = Utc::now();
-    let after = capture_workspace_snapshot(&trace.event.cwd);
+    let after =
+        capture_workspace_snapshot(&trace.event.cwd, &trace.workspace_ignored_path_prefixes);
 
     let stdout_sha256 = sha256_file(&trace.paths.stdout)?;
     let stderr_sha256 = sha256_file(&trace.paths.stderr)?;
@@ -248,6 +256,35 @@ fn finish_trace(
     store.write_manifest_and_hash(&trace.paths, &manifest)?;
 
     Ok(manifest)
+}
+
+fn workspace_ignored_path_prefixes(
+    cwd: &std::path::Path,
+    trace_root: &std::path::Path,
+) -> Vec<String> {
+    let absolute_trace_root = if trace_root.is_absolute() {
+        trace_root.to_path_buf()
+    } else {
+        cwd.join(trace_root)
+    };
+
+    let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+
+    let trace_root = absolute_trace_root
+        .canonicalize()
+        .unwrap_or(absolute_trace_root);
+
+    let Ok(relative) = trace_root.strip_prefix(&cwd) else {
+        return Vec::new();
+    };
+
+    let relative = relative.to_string_lossy().replace('\\', "/");
+
+    if relative.is_empty() {
+        Vec::new()
+    } else {
+        vec![relative]
+    }
 }
 
 #[cfg(test)]

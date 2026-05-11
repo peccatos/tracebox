@@ -54,13 +54,26 @@ impl WorkspaceSnapshot {
 
 /// Capture git metadata and dirty workspace state.
 ///
-/// All failures degrade to partial/empty evidence. Git inspection failure must
-/// not fail the traced command.
-pub fn capture_workspace_snapshot(cwd: &Path) -> WorkspaceSnapshot {
+/// `ignored_path_prefixes` are git-relative path prefixes that must be excluded
+/// from evidence. This is essential because Tracebox often stores `.traces/`
+/// inside the same workspace it observes.
+///
+/// Without this exclusion, Tracebox observes its own evidence artifacts and
+/// incorrectly reports:
+///
+/// - `dirty_before = true`;
+/// - `.traces/...` as created files;
+/// - self-caused workspace mutations.
+///
+/// Evidence storage is not part of the traced command's workspace mutation.
+pub fn capture_workspace_snapshot(
+    cwd: &Path,
+    ignored_path_prefixes: &[String],
+) -> WorkspaceSnapshot {
     WorkspaceSnapshot {
         commit: git_output(cwd, &["rev-parse", "HEAD"]),
         branch: git_output(cwd, &["rev-parse", "--abbrev-ref", "HEAD"]),
-        status: git_status(cwd),
+        status: git_status(cwd, ignored_path_prefixes),
     }
 }
 
@@ -162,9 +175,9 @@ fn git_output(cwd: &Path, args: &[&str]) -> Option<String> {
     }
 }
 
-fn git_status(cwd: &Path) -> BTreeMap<String, FileStatus> {
+fn git_status(cwd: &Path, ignored_path_prefixes: &[String]) -> BTreeMap<String, FileStatus> {
     let output = Command::new("git")
-        .args(["status", "--porcelain=v1"])
+        .args(["status", "--porcelain", "--untracked-files=all"])
         .current_dir(cwd)
         .output();
 
@@ -188,26 +201,17 @@ fn git_status(cwd: &Path) -> BTreeMap<String, FileStatus> {
         }
 
         let status_code = &line[0..2];
-        let path = parse_porcelain_path(&line[3..]);
+        let path = normalize_git_path(&line[3..]);
+
+        if should_ignore_git_path(&path, ignored_path_prefixes) {
+            continue;
+        }
 
         let status = classify_porcelain_status(status_code);
         map.insert(path, status);
     }
 
     map
-}
-
-fn parse_porcelain_path(raw: &str) -> String {
-    // Rename lines look like:
-    // R  old/path -> new/path
-    //
-    // For v0.1, record the destination path because that is what exists after
-    // the operation. Deeper rename semantics can be added later.
-    if let Some((_, new_path)) = raw.split_once(" -> ") {
-        new_path.to_string()
-    } else {
-        raw.to_string()
-    }
 }
 
 fn classify_porcelain_status(status_code: &str) -> FileStatus {
@@ -220,11 +224,27 @@ fn classify_porcelain_status(status_code: &str) -> FileStatus {
     }
 }
 
+fn normalize_git_path(path: &str) -> String {
+    path.replace('\\', "/")
+}
+
+fn should_ignore_git_path(path: &str, ignored_path_prefixes: &[String]) -> bool {
+    ignored_path_prefixes.iter().any(|prefix| {
+        let prefix = prefix.trim_matches('/');
+
+        if prefix.is_empty() {
+            return false;
+        }
+
+        path == prefix || path.starts_with(&format!("{prefix}/"))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
 
-    use super::{diff_snapshots, FileStatus, WorkspaceSnapshot};
+    use super::{diff_snapshots, should_ignore_git_path, FileStatus, WorkspaceSnapshot};
 
     #[test]
     fn detects_created_files() {
@@ -247,16 +267,16 @@ mod tests {
 
     #[test]
     fn does_not_attribute_preexisting_dirty_file_without_status_change() {
-        let mut status = BTreeMap::new();
-        status.insert("src/lib.rs".to_string(), FileStatus::Modified);
+        let mut before_status = BTreeMap::new();
+        before_status.insert("src/lib.rs".to_string(), FileStatus::Modified);
 
         let before = WorkspaceSnapshot {
-            status: status.clone(),
+            status: before_status.clone(),
             ..WorkspaceSnapshot::default()
         };
 
         let after = WorkspaceSnapshot {
-            status,
+            status: before_status,
             ..WorkspaceSnapshot::default()
         };
 
@@ -282,5 +302,20 @@ mod tests {
         let diff = diff_snapshots(&before, &after);
 
         assert_eq!(diff.modified_files, vec!["src/lib.rs"]);
+        assert!(diff.created_files.is_empty());
+        assert!(diff.deleted_files.is_empty());
+    }
+
+    #[test]
+    fn ignores_tracebox_artifact_paths_by_prefix() {
+        let ignored = vec![".traces".to_string()];
+
+        assert!(should_ignore_git_path(
+            ".traces/trc_123/stdout.log",
+            &ignored
+        ));
+        assert!(should_ignore_git_path(".traces", &ignored));
+        assert!(!should_ignore_git_path(".traces-other/file", &ignored));
+        assert!(!should_ignore_git_path("src/lib.rs", &ignored));
     }
 }
