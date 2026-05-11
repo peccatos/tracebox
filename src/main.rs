@@ -1,0 +1,43 @@
+use anyhow::Result;
+use clap::Parser;
+
+use tracebox::cli::{Cli, Commands};
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    match cli.command {
+        Commands::Run {
+            parent,
+            tool_kind,
+            command,
+        } => {
+            let exit_code =
+                tracebox::commands::run::execute(cli.trace_root, parent, tool_kind, command)?;
+
+            // Tracebox should behave like a transparent command wrapper:
+            // if the wrapped command fails, the Tracebox process should fail
+            // with the same exit code. The trace is still written.
+            std::process::exit(exit_code);
+        }
+
+        Commands::Inspect {
+            trace_id,
+            stdout,
+            stderr,
+            tail,
+        } => {
+            tracebox::commands::inspect::execute(cli.trace_root, trace_id, stdout, stderr, tail)?;
+        }
+
+        Commands::List { json } => {
+            tracebox::commands::list::execute(cli.trace_root, json)?;
+        }
+
+        Commands::Diff { left, right } => {
+            tracebox::commands::diff::execute(cli.trace_root, left, right)?;
+        }
+    }
+
+    Ok(())
+}
