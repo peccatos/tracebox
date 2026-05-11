@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 description = "Linux-native immutable execution evidence runtime"
-repository = "https://github.com/your-org/tracebox"
+repository = "https://github.com/peccatos/tracebox"
 readme = "README.md"
 
 [dependencies]

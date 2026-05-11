@@ -1,0 +1,83 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  linux-gnu:
+    name: Build Linux GNU release artifact
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify formatting
+        run: cargo fmt --check
+
+      - name: Run clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Run tests
+        run: cargo test --locked
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Prepare release archive
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TAG="${GITHUB_REF_NAME}"
+          TARGET="x86_64-unknown-linux-gnu"
+          PACKAGE="tracebox-${TAG}-${TARGET}"
+
+          mkdir -p "dist/${PACKAGE}"
+
+          cp target/release/tracebox "dist/${PACKAGE}/tracebox"
+          cp README.md "dist/${PACKAGE}/README.md"
+          cp LICENSE "dist/${PACKAGE}/LICENSE"
+
+          tar -C dist -czf "dist/${PACKAGE}.tar.gz" "${PACKAGE}"
+
+          cd dist
+          sha256sum "${PACKAGE}.tar.gz" > checksums.txt
+
+      - name: Create GitHub release if needed
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          TAG="${GITHUB_REF_NAME}"
+
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "Release ${TAG} already exists"
+          else
+            gh release create "${TAG}" \
+              --title "Tracebox ${TAG}" \
+              --notes "Automated release for ${TAG}" \
+              --prerelease
+          fi
+
+      - name: Upload release artifacts
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          gh release upload "${GITHUB_REF_NAME}" \
+            dist/*.tar.gz \
+            dist/checksums.txt \
+            --clobber
