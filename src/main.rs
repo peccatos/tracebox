@@ -43,6 +43,11 @@ fn main() -> Result<()> {
             std::process::exit(exit_code);
         }
 
+        Commands::Validate { trace_id, json } => {
+            let exit_code = tracebox::commands::validate::execute(cli.trace_root, trace_id, json)?;
+            std::process::exit(exit_code);
+        }
+
         Commands::List { json } => {
             tracebox::commands::list::execute(cli.trace_root, json)?;
         }

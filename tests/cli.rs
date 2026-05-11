@@ -403,6 +403,77 @@ fn inspect_verify_and_diff_support_json_output() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn validate_accepts_valid_trace_and_rejects_semantically_invalid_manifest() -> Result<()> {
+    let temp = TempDir::new()?;
+
+    let mut run = Command::cargo_bin("tracebox")?;
+    run.current_dir(temp.path())
+        .args(["run", "--", "sh", "-c", "printf valid"]);
+
+    run.assert().success();
+
+    let trace_dir = single_trace_dir(temp.path())?;
+
+    let trace_id = trace_dir
+        .file_name()
+        .context("trace directory should have a file name")?
+        .to_string_lossy()
+        .to_string();
+
+    let mut validate = Command::cargo_bin("tracebox")?;
+
+    validate
+        .current_dir(temp.path())
+        .args(["validate", &trace_id])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Status: OK"))
+        .stdout(predicate::str::contains("manifest_version: OK"))
+        .stdout(predicate::str::contains("trace_id_matches_directory: OK"));
+
+    let validate_json_output = Command::cargo_bin("tracebox")?
+        .current_dir(temp.path())
+        .args(["validate", &trace_id, "--json"])
+        .output()?;
+
+    assert!(validate_json_output.status.success());
+
+    let validate_json: Value = serde_json::from_slice(&validate_json_output.stdout)?;
+
+    assert_eq!(validate_json["trace_id"], trace_id);
+    assert_eq!(validate_json["status"], "OK");
+    assert!(validate_json["checks"]
+        .as_array()
+        .context("checks should be an array")?
+        .iter()
+        .any(|check| check["name"] == "manifest_version" && check["status"] == "OK"));
+
+    let manifest_path = trace_dir.join("manifest.json");
+    let mut manifest = read_manifest(&trace_dir)?;
+
+    manifest["trace_id"] = Value::String("trc_wrong".to_string());
+
+    fs::write(
+        &manifest_path,
+        format!("{}\n", serde_json::to_string_pretty(&manifest)?),
+    )?;
+
+    let mut validate_after_tamper = Command::cargo_bin("tracebox")?;
+
+    validate_after_tamper
+        .current_dir(temp.path())
+        .args(["validate", &trace_id])
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains("Status: FAILED"))
+        .stdout(predicate::str::contains(
+            "trace_id_matches_directory: FAILED",
+        ));
+
+    Ok(())
+}
+
 fn trace_ids_from_list_json(workspace: &Path) -> Result<Vec<String>> {
     let output = Command::cargo_bin("tracebox")?
         .current_dir(workspace)
