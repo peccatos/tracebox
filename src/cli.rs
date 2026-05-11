@@ -77,6 +77,16 @@ pub enum Commands {
         json: bool,
     },
 
+    /// Validate trace manifest schema and semantic consistency.
+    Validate {
+        /// Trace ID, for example `trc_019...`.
+        trace_id: String,
+
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// List available traces.
     List {
         /// Emit JSON instead of a human table.
