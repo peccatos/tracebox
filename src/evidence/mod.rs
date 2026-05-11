@@ -6,6 +6,7 @@ pub mod manifest;
 pub mod output;
 pub mod recorder;
 pub mod store;
+pub mod validation;
 pub mod workspace;
 
 pub use event::{ExecutionContext, ToolFinished, ToolStarted};
