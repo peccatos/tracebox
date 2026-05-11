@@ -330,3 +330,96 @@ fn verify_passes_for_intact_trace_and_fails_after_tampering() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn inspect_verify_and_diff_support_json_output() -> Result<()> {
+    let temp = TempDir::new()?;
+
+    let mut first = Command::cargo_bin("tracebox")?;
+    first
+        .current_dir(temp.path())
+        .args(["run", "--", "sh", "-c", "printf first"]);
+    first.assert().success();
+
+    let mut second = Command::cargo_bin("tracebox")?;
+    second
+        .current_dir(temp.path())
+        .args(["run", "--", "sh", "-c", "printf second && exit 3"]);
+    second.assert().code(3);
+
+    let trace_ids = trace_ids_from_list_json(temp.path())?;
+
+    assert_eq!(trace_ids.len(), 2);
+
+    let first_trace = &trace_ids[0];
+    let second_trace = &trace_ids[1];
+
+    let inspect_output = Command::cargo_bin("tracebox")?
+        .current_dir(temp.path())
+        .args(["inspect", first_trace, "--json", "--stdout"])
+        .output()?;
+
+    assert!(inspect_output.status.success());
+
+    let inspect_json: Value = serde_json::from_slice(&inspect_output.stdout)?;
+
+    assert_eq!(inspect_json["trace"]["trace_id"], *first_trace);
+    assert_eq!(inspect_json["trace"]["exit_code"], 0);
+    assert_eq!(inspect_json["stdout_tail"][0], "first");
+
+    let verify_output = Command::cargo_bin("tracebox")?
+        .current_dir(temp.path())
+        .args(["verify", first_trace, "--json"])
+        .output()?;
+
+    assert!(verify_output.status.success());
+
+    let verify_json: Value = serde_json::from_slice(&verify_output.stdout)?;
+
+    assert_eq!(verify_json["trace_id"], *first_trace);
+    assert_eq!(verify_json["status"], "OK");
+    assert!(
+        verify_json["checks"]
+            .as_array()
+            .context("checks should be an array")?
+            .len()
+            >= 3
+    );
+
+    let diff_output = Command::cargo_bin("tracebox")?
+        .current_dir(temp.path())
+        .args(["diff", first_trace, second_trace, "--json"])
+        .output()?;
+
+    assert!(diff_output.status.success());
+
+    let diff_json: Value = serde_json::from_slice(&diff_output.stdout)?;
+
+    assert_eq!(diff_json["left_trace_id"], *first_trace);
+    assert_eq!(diff_json["right_trace_id"], *second_trace);
+    assert_eq!(diff_json["fields"]["exit_code"]["changed"], true);
+    assert_eq!(diff_json["summary"]["stdout_changed"], true);
+
+    Ok(())
+}
+
+fn trace_ids_from_list_json(workspace: &Path) -> Result<Vec<String>> {
+    let output = Command::cargo_bin("tracebox")?
+        .current_dir(workspace)
+        .args(["list", "--json"])
+        .output()?;
+
+    assert!(output.status.success());
+
+    let traces: Vec<Value> = serde_json::from_slice(&output.stdout)?;
+
+    traces
+        .into_iter()
+        .map(|trace| {
+            trace["trace_id"]
+                .as_str()
+                .map(ToOwned::to_owned)
+                .context("trace_id should be a string")
+        })
+        .collect()
+}

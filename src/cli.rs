@@ -61,12 +61,20 @@ pub enum Commands {
         /// Number of log lines to print when showing stdout/stderr.
         #[arg(long, default_value_t = 40)]
         tail: usize,
+
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
     },
 
     /// Verify trace artifact integrity.
     Verify {
         /// Trace ID, for example `trc_019...`.
         trace_id: String,
+
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
     },
 
     /// List available traces.
@@ -83,5 +91,9 @@ pub enum Commands {
 
         /// Right/target trace ID.
         right: String,
+
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
     },
 }
