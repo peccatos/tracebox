@@ -1,0 +1,446 @@
+From 6bee428b52d743683536edf92b6f4cf285ca49c2 Mon Sep 17 00:00:00 2001
+From: peccatos <madeinsiberiaa@gmail.com>
+Date: Wed, 13 May 2026 09:26:32 +0700
+Subject: [PATCH] Record Tracebox evidence for app-server command exec
+
+---
+ codex-rs/Cargo.lock                          |   1 +
+ codex-rs/app-server/Cargo.toml               |   1 +
+ codex-rs/app-server/src/command_exec.rs      |  48 +++-
+ codex-rs/app-server/src/lib.rs               |   1 +
+ codex-rs/app-server/src/tracebox_evidence.rs | 276 +++++++++++++++++++
+ 5 files changed, 324 insertions(+), 3 deletions(-)
+ create mode 100644 codex-rs/app-server/src/tracebox_evidence.rs
+
+diff --git a/codex-rs/Cargo.lock b/codex-rs/Cargo.lock
+index 75c1ea7..82b55a0 100644
+--- a/codex-rs/Cargo.lock
++++ b/codex-rs/Cargo.lock
+@@ -1938,6 +1938,7 @@ dependencies = [
+  "serde",
+  "serde_json",
+  "serial_test",
++ "sha2",
+  "shlex",
+  "tar",
+  "tempfile",
+diff --git a/codex-rs/app-server/Cargo.toml b/codex-rs/app-server/Cargo.toml
+index fcf731a..b727404 100644
+--- a/codex-rs/app-server/Cargo.toml
++++ b/codex-rs/app-server/Cargo.toml
+@@ -75,6 +75,7 @@ clap = { workspace = true, features = ["derive"] }
+ futures = { workspace = true }
+ serde = { workspace = true, features = ["derive"] }
+ serde_json = { workspace = true }
++sha2 = { workspace = true }
+ tempfile = { workspace = true }
+ thiserror = { workspace = true }
+ time = { workspace = true }
+diff --git a/codex-rs/app-server/src/command_exec.rs b/codex-rs/app-server/src/command_exec.rs
+index 443117e..437bc49 100644
+--- a/codex-rs/app-server/src/command_exec.rs
++++ b/codex-rs/app-server/src/command_exec.rs
+@@ -40,6 +40,7 @@ use crate::error_code::invalid_request;
+ use crate::outgoing_message::ConnectionId;
+ use crate::outgoing_message::ConnectionRequestId;
+ use crate::outgoing_message::OutgoingMessageSender;
++use crate::tracebox_evidence::{TraceboxCommandEvidence, maybe_record_command_evidence};
+ 
+ const EXEC_TIMEOUT_EXIT_CODE: i32 = 124;
+ const OUTPUT_CHUNK_SIZE_HINT: usize = 64 * 1024;
+@@ -107,6 +108,11 @@ struct RunCommandParams {
+     stream_stdout_stderr: bool,
+     expiration: ExecExpiration,
+     output_bytes_cap: Option<usize>,
++
++    // Tracebox metadata is captured before ExecRequest is moved into the runtime.
++    // The recorder is diagnostic only; it must not own command execution.
++    trace_command: Vec<String>,
++    trace_cwd: std::path::PathBuf,
+ }
+ 
+ struct SpawnProcessOutputParams {
+@@ -156,6 +162,9 @@ impl CommandExecManager {
+             output_bytes_cap,
+             size,
+         } = params;
++
++        let trace_command = exec_request.command.clone();
++        let trace_cwd = exec_request.cwd.as_path().to_path_buf();
+         if process_id.is_none() && (tty || stream_stdin || stream_stdout_stderr) {
+             return Err(invalid_request(
+                 "command/exec tty or streaming requires a client-supplied processId",
+@@ -200,19 +209,37 @@ impl CommandExecManager {
+                 );
+             }
+             let sessions = Arc::clone(&self.sessions);
++            let trace_command_for_recording = trace_command.clone();
++            let trace_cwd_for_recording = trace_cwd.clone();
++
+             tokio::spawn(async move {
+                 let _started_network_proxy = started_network_proxy;
+                 match codex_core::sandboxing::execute_env(exec_request, /*stdout_stream*/ None)
+                     .await
+                 {
+                     Ok(output) => {
++                        let exit_code = output.exit_code;
++                        let stdout = output.stdout.text;
++                        let stderr = output.stderr.text;
++
++                        if let Err(err) = maybe_record_command_evidence(TraceboxCommandEvidence {
++                            command: trace_command_for_recording,
++                            cwd: trace_cwd_for_recording,
++                            exit_code,
++                            stdout: stdout.clone(),
++                            stderr: stderr.clone(),
++                            source: "command_exec.windows_sandbox",
++                        }) {
++                            tracing::warn!("failed to write Tracebox command/exec evidence: {err}");
++                        }
++
+                         outgoing
+                             .send_response(
+                                 request_id,
+                                 CommandExecResponse {
+-                                    exit_code: output.exit_code,
+-                                    stdout: output.stdout.text,
+-                                    stderr: output.stderr.text,
++                                    exit_code,
++                                    stdout,
++                                    stderr,
+                                 },
+                             )
+                             .await;
+@@ -298,6 +325,8 @@ impl CommandExecManager {
+                 stream_stdout_stderr,
+                 expiration,
+                 output_bytes_cap,
++                trace_command,
++                trace_cwd,
+             })
+             .await;
+             sessions.lock().await.remove(&process_key);
+@@ -450,6 +479,8 @@ async fn run_command(params: RunCommandParams) {
+         stream_stdout_stderr,
+         expiration,
+         output_bytes_cap,
++        trace_command,
++        trace_cwd,
+     } = params;
+     let mut control_rx = control_rx;
+     let mut control_open = true;
+@@ -541,6 +572,17 @@ async fn run_command(params: RunCommandParams) {
+     let stderr = stderr_handle.await.unwrap_or_default();
+     timeout_handle.abort();
+ 
++    if let Err(err) = maybe_record_command_evidence(TraceboxCommandEvidence {
++        command: trace_command,
++        cwd: trace_cwd,
++        exit_code,
++        stdout: stdout.clone(),
++        stderr: stderr.clone(),
++        source: "command_exec.local_spawn",
++    }) {
++        tracing::warn!("failed to write Tracebox command/exec evidence: {err}");
++    }
++
+     outgoing
+         .send_response(
+             request_id,
+diff --git a/codex-rs/app-server/src/lib.rs b/codex-rs/app-server/src/lib.rs
+index 1538b45..d2042eb 100644
+--- a/codex-rs/app-server/src/lib.rs
++++ b/codex-rs/app-server/src/lib.rs
+@@ -95,6 +95,7 @@ mod server_request_error;
+ mod skills_watcher;
+ mod thread_state;
+ mod thread_status;
++mod tracebox_evidence;
+ mod transport;
+ 
+ pub use crate::error_code::INPUT_TOO_LARGE_ERROR_CODE;
+diff --git a/codex-rs/app-server/src/tracebox_evidence.rs b/codex-rs/app-server/src/tracebox_evidence.rs
+new file mode 100644
+index 0000000..b80edab
+--- /dev/null
++++ b/codex-rs/app-server/src/tracebox_evidence.rs
+@@ -0,0 +1,276 @@
++use std::env;
++use std::fs;
++use std::io::Write;
++use std::path::PathBuf;
++
++use anyhow::Context;
++use chrono::Utc;
++use serde::Serialize;
++use sha2::Digest;
++use sha2::Sha256;
++use uuid::Uuid;
++
++/// Environment variable that enables the local Tracebox proof recorder.
++///
++/// This is intentionally opt-in. Codex tests and normal app-server execution
++/// must not write evidence bundles unless the developer explicitly asks for it.
++const TRACEBOX_ENABLED_ENV: &str = "TRACEBOX_ENABLED";
++
++/// Environment variable that selects where trace directories are written.
++///
++/// The value is treated as a direct trace root. Unlike the standalone tracebox
++/// CLI, this proof writer does not create a nested `.traces` directory by
++/// default. That keeps the integration test easy to inspect:
++///
++/// ```text
++/// TRACEBOX_ROOT=/tmp/codex-tracebox-proof
++/// /tmp/codex-tracebox-proof/trc_...
++/// ```
++const TRACEBOX_ROOT_ENV: &str = "TRACEBOX_ROOT";
++
++/// Minimal command execution record passed from `command_exec`.
++///
++/// This type deliberately contains only data that is already available at the
++/// app-server boundary after execution. The recorder must not own process
++/// execution, otherwise it would change command/exec semantics and could break
++/// stdout/stderr delivery to clients.
++#[derive(Debug, Clone)]
++pub(crate) struct TraceboxCommandEvidence {
++    /// Command argv as Codex executed it.
++    pub(crate) command: Vec<String>,
++
++    /// Working directory used for the command.
++    pub(crate) cwd: PathBuf,
++
++    /// Process exit code observed by Codex.
++    pub(crate) exit_code: i32,
++
++    /// Captured stdout returned to the command/exec caller.
++    pub(crate) stdout: String,
++
++    /// Captured stderr returned to the command/exec caller.
++    pub(crate) stderr: String,
++
++    /// Human-readable execution path marker.
++    ///
++    /// Examples:
++    /// - `command_exec.windows_sandbox`
++    /// - `command_exec.local_spawn`
++    ///
++    /// The value is metadata only; it avoids pretending that every Codex
++    /// command path is identical internally.
++    pub(crate) source: &'static str,
++}
++
++/// Write a Tracebox-compatible evidence bundle if explicitly enabled.
++///
++/// Failure to write evidence is reported to the caller but must not be treated
++/// as command execution failure. The command already ran; breaking command/exec
++/// because a diagnostic sidecar failed would be the wrong coupling.
++pub(crate) fn maybe_record_command_evidence(
++    evidence: TraceboxCommandEvidence,
++) -> anyhow::Result<Option<PathBuf>> {
++    if !tracebox_enabled() {
++        return Ok(None);
++    }
++
++    let trace_root = trace_root_from_env()?;
++    fs::create_dir_all(&trace_root).with_context(|| {
++        format!(
++            "failed to create Tracebox evidence root {}",
++            trace_root.display()
++        )
++    })?;
++
++    let trace_id = format!("trc_{}", Uuid::now_v7());
++    let trace_dir = trace_root.join(&trace_id);
++
++    // Use create_dir instead of create_dir_all for the final trace directory.
++    // A UUID collision is effectively impossible, but create_dir makes an
++    // accidental overwrite structurally impossible.
++    fs::create_dir(&trace_dir)
++        .with_context(|| format!("failed to create Tracebox trace {}", trace_dir.display()))?;
++
++    let stdout_sha256 = sha256_hex(evidence.stdout.as_bytes());
++    let stderr_sha256 = sha256_hex(evidence.stderr.as_bytes());
++
++    write_file_atomic(trace_dir.join("stdout.log"), evidence.stdout.as_bytes())?;
++    write_file_atomic(trace_dir.join("stderr.log"), evidence.stderr.as_bytes())?;
++
++    let now = Utc::now().to_rfc3339();
++
++    let manifest = TraceboxManifest {
++        manifest_version: 1,
++        trace_id: trace_id.clone(),
++        tool_kind: "codex-command-exec",
++        source: evidence.source,
++        command: evidence.command,
++        cwd: evidence.cwd.display().to_string(),
++        started_at: now.clone(),
++        finished_at: now,
++        duration_ms: 0,
++        exit_code: evidence.exit_code,
++        artifacts: TraceboxArtifacts {
++            stdout: "stdout.log",
++            stderr: "stderr.log",
++            pty: None,
++        },
++        integrity: TraceboxIntegrity {
++            stdout_sha256,
++            stderr_sha256,
++            pty_sha256: None,
++        },
++    };
++
++    let manifest_json =
++        serde_json::to_vec_pretty(&manifest).context("failed to serialize Tracebox manifest")?;
++
++    let manifest_sha256 = sha256_hex(&manifest_json);
++
++    write_file_atomic(trace_dir.join("manifest.json"), &manifest_json)?;
++    write_file_atomic(
++        trace_dir.join("manifest.sha256"),
++        format!("{manifest_sha256}  manifest.json\n").as_bytes(),
++    )?;
++
++    Ok(Some(trace_dir))
++}
++
++fn tracebox_enabled() -> bool {
++    match env::var(TRACEBOX_ENABLED_ENV) {
++        Ok(value) => {
++            let value = value.trim().to_ascii_lowercase();
++            matches!(value.as_str(), "1" | "true" | "yes" | "on")
++        }
++        Err(_) => false,
++    }
++}
++
++fn trace_root_from_env() -> anyhow::Result<PathBuf> {
++    let value = env::var(TRACEBOX_ROOT_ENV).with_context(|| {
++        format!("{TRACEBOX_ROOT_ENV} must be set when Tracebox evidence is enabled")
++    })?;
++
++    let trimmed = value.trim();
++
++    anyhow::ensure!(
++        !trimmed.is_empty(),
++        "{TRACEBOX_ROOT_ENV} must not be empty when Tracebox evidence is enabled"
++    );
++
++    Ok(PathBuf::from(trimmed))
++}
++
++fn sha256_hex(bytes: &[u8]) -> String {
++    let digest = Sha256::digest(bytes);
++    format!("{digest:x}")
++}
++
++fn write_file_atomic(path: PathBuf, bytes: &[u8]) -> anyhow::Result<()> {
++    let parent = path
++        .parent()
++        .with_context(|| format!("path has no parent: {}", path.display()))?;
++
++    fs::create_dir_all(parent)
++        .with_context(|| format!("failed to create parent directory {}", parent.display()))?;
++
++    let file_name = path
++        .file_name()
++        .and_then(|name| name.to_str())
++        .with_context(|| format!("path has invalid file name: {}", path.display()))?;
++
++    let tmp_path = parent.join(format!(".{file_name}.tmp-{}", Uuid::now_v7()));
++
++    {
++        let mut file = fs::File::create(&tmp_path)
++            .with_context(|| format!("failed to create temp file {}", tmp_path.display()))?;
++
++        file.write_all(bytes)
++            .with_context(|| format!("failed to write temp file {}", tmp_path.display()))?;
++
++        file.sync_all()
++            .with_context(|| format!("failed to fsync temp file {}", tmp_path.display()))?;
++    }
++
++    fs::rename(&tmp_path, &path).with_context(|| {
++        format!(
++            "failed to rename {} to {}",
++            tmp_path.display(),
++            path.display()
++        )
++    })?;
++
++    Ok(())
++}
++
++#[derive(Debug, Serialize)]
++struct TraceboxManifest {
++    manifest_version: u32,
++    trace_id: String,
++    tool_kind: &'static str,
++    source: &'static str,
++    command: Vec<String>,
++    cwd: String,
++    started_at: String,
++    finished_at: String,
++    duration_ms: u128,
++    exit_code: i32,
++    artifacts: TraceboxArtifacts,
++    integrity: TraceboxIntegrity,
++}
++
++#[derive(Debug, Serialize)]
++struct TraceboxArtifacts {
++    stdout: &'static str,
++    stderr: &'static str,
++    pty: Option<&'static str>,
++}
++
++#[derive(Debug, Serialize)]
++struct TraceboxIntegrity {
++    stdout_sha256: String,
++    stderr_sha256: String,
++    pty_sha256: Option<String>,
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn tracebox_enabled_accepts_common_truthy_values() {
++        assert!(matches_truthy("1"));
++        assert!(matches_truthy("true"));
++        assert!(matches_truthy("yes"));
++        assert!(matches_truthy("on"));
++
++        assert!(!matches_truthy("0"));
++        assert!(!matches_truthy("false"));
++        assert!(!matches_truthy(""));
++    }
++
++    fn matches_truthy(value: &str) -> bool {
++        let value = value.trim().to_ascii_lowercase();
++        matches!(value.as_str(), "1" | "true" | "yes" | "on")
++    }
++
++    #[test]
++    fn sha256_hex_returns_lowercase_digest() {
++        assert_eq!(
++            sha256_hex(b"hello"),
++            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
++        );
++    }
++
++    #[test]
++    fn write_file_atomic_creates_file_contents() -> anyhow::Result<()> {
++        let temp = tempfile::TempDir::new()?;
++        let path = temp.path().join("nested").join("file.txt");
++
++        write_file_atomic(path.clone(), b"ok")?;
++
++        assert_eq!(fs::read_to_string(path)?, "ok");
++
++        Ok(())
++    }
++}
+-- 
+2.51.0
+
