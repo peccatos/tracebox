@@ -376,10 +376,12 @@ impl TraceBrowserState {
             KeyCode::Backspace => {
                 self.pop_filter_char();
             }
-            KeyCode::Char(c) if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT => {
+            KeyCode::Char(c)
+                if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+            {
                 self.push_filter_char(c);
             }
-                KeyCode::Char(_) => {}
+            KeyCode::Char(_) => {}
             _ => {}
         }
 
