@@ -22,7 +22,19 @@ jobs:
         run: cargo fmt --check
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --all-features -- -D warnings
 
-      - name: Test
-        run: cargo test --locked
+      - name: Build Tracebox
+        run: cargo build --locked --all-features
+
+      - name: Test with Tracebox
+        run: ./target/debug/tracebox run -- cargo test --locked --all-features
+
+      - name: Upload Tracebox evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tracebox-ci-evidence
+          path: .traces/
+          if-no-files-found: ignore
+
