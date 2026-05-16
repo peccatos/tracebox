@@ -21,7 +21,7 @@ use crossterm::terminal::{
 #[cfg(feature = "tui")]
 use ratatui::backend::CrosstermBackend;
 #[cfg(feature = "tui")]
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout};
 #[cfg(feature = "tui")]
 use ratatui::style::{Color, Modifier, Style};
 #[cfg(feature = "tui")]
@@ -30,6 +30,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Tabs, Wrap};
 #[cfg(feature = "tui")]
 use ratatui::{Frame, Terminal};
+
+const HELP_FOOTER: &str =
+    "q quit | \u{2191}/\u{2193} move | Tab switch | / filter | Enter details | v verify | r report | a archive | u restore";
 
 #[cfg(feature = "tui")]
 pub fn execute(trace_root: PathBuf) -> Result<()> {
@@ -53,6 +56,20 @@ pub struct TraceBrowserState {
 enum DetailView {
     Help,
     Text(String),
+}
+
+#[derive(Debug, Clone)]
+struct VerificationResult {
+    ok: bool,
+    text: String,
+    failure_reason: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ArtifactVerification {
+    ok: bool,
+    rendered: String,
+    reason: Option<String>,
 }
 
 impl TraceBrowserState {
@@ -99,6 +116,33 @@ impl TraceBrowserState {
 
     pub fn status(&self) -> &str {
         &self.status
+    }
+
+    pub fn status_text(&self) -> String {
+        format!("{} | {}", self.filter_line(), self.status_line())
+    }
+
+    pub fn keys_text(&self) -> &'static str {
+        HELP_FOOTER
+    }
+
+    pub fn footer_text(&self) -> String {
+        format!("{}\n{}", self.status_text(), self.keys_text())
+    }
+
+    pub fn empty_state_message(&self) -> Option<String> {
+        if !self.visible_traces().is_empty() {
+            return None;
+        }
+
+        if self.filter.trim().is_empty() {
+            Some(match self.tab {
+                TraceTab::Active => "No active traces found".to_string(),
+                TraceTab::Archived => "No archived traces found".to_string(),
+            })
+        } else {
+            Some("No traces match filter".to_string())
+        }
     }
 
     pub fn detail_text(&self) -> Option<&str> {
@@ -153,9 +197,26 @@ impl TraceBrowserState {
             .selected_trace()
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("no trace selected"))?;
-        let verify = build_verify_text(&self.trace_root, &summary)?;
-        self.detail = DetailView::Text(verify);
-        self.status = format!("Verified {}", summary.trace_id);
+        match build_verify_text(&self.trace_root, &summary) {
+            Ok(result) => {
+                self.detail = DetailView::Text(result.text);
+                self.status = if result.ok {
+                    "Verification: OK".to_string()
+                } else {
+                    format!(
+                        "Verification failed: {}",
+                        result
+                            .failure_reason
+                            .unwrap_or_else(|| "verification failed".to_string())
+                    )
+                };
+            }
+            Err(err) => {
+                self.detail = DetailView::Text(format!("Verification failed: {err}"));
+                self.status = format!("Error: {err}");
+                return Err(err);
+            }
+        }
         Ok(())
     }
 
@@ -165,20 +226,34 @@ impl TraceBrowserState {
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("no trace selected"))?;
         let store = FilesystemTraceStore::new(TraceStoreConfig::new(&self.trace_root));
-        let resolved = store.resolve_trace(&summary.trace_id)?;
-        let manifest = store.load_manifest_at(&resolved.paths)?;
-        let report_path = resolved.paths.root.join("report.md");
-        let report_text = report::build_report(&resolved.paths.root, &manifest, &resolved.paths)?;
+        let result = (|| -> Result<(PathBuf, String)> {
+            let resolved = store.resolve_trace(&summary.trace_id)?;
+            let manifest = store.load_manifest_at(&resolved.paths)?;
+            let report_path = resolved.paths.root.join("report.md");
+            let report_text =
+                report::build_report(&resolved.paths.root, &manifest, &resolved.paths)?;
 
-        fs::write(&report_path, report_text)
-            .with_context(|| format!("failed to write {}", report_path.display()))?;
+            fs::write(&report_path, report_text)
+                .with_context(|| format!("failed to write {}", report_path.display()))?;
 
-        let rendered = fs::read_to_string(&report_path)
-            .with_context(|| format!("failed to read {}", report_path.display()))?;
+            let rendered = fs::read_to_string(&report_path)
+                .with_context(|| format!("failed to read {}", report_path.display()))?;
 
-        self.detail = DetailView::Text(rendered);
-        self.status = format!("Report written: {}", report_path.display());
-        Ok(())
+            Ok((report_path, rendered))
+        })();
+
+        match result {
+            Ok((report_path, rendered)) => {
+                self.detail = DetailView::Text(rendered);
+                self.status = format!("Report written: {}", report_path.display());
+                Ok(())
+            }
+            Err(err) => {
+                self.detail = DetailView::Text(format!("Error: {err}"));
+                self.status = format!("Error: {err}");
+                Err(err)
+            }
+        }
     }
 
     pub fn archive_selected(&mut self) -> Result<()> {
@@ -190,10 +265,17 @@ impl TraceBrowserState {
             .clone();
 
         let store = FilesystemTraceStore::new(TraceStoreConfig::new(&self.trace_root));
-        store.archive_trace(&trace_id)?;
-        self.refresh()?;
-        self.status = format!("Archived {trace_id}");
-        Ok(())
+        match store.archive_trace(&trace_id) {
+            Ok(_) => {
+                self.refresh()?;
+                self.status = format!("Archived trace: {trace_id}");
+                Ok(())
+            }
+            Err(err) => {
+                self.status = format!("Error: {err}");
+                Err(err)
+            }
+        }
     }
 
     pub fn restore_selected(&mut self) -> Result<()> {
@@ -205,10 +287,17 @@ impl TraceBrowserState {
             .clone();
 
         let store = FilesystemTraceStore::new(TraceStoreConfig::new(&self.trace_root));
-        store.restore_trace(&trace_id)?;
-        self.refresh()?;
-        self.status = format!("Restored {trace_id}");
-        Ok(())
+        match store.restore_trace(&trace_id) {
+            Ok(_) => {
+                self.refresh()?;
+                self.status = format!("Restored trace: {trace_id}");
+                Ok(())
+            }
+            Err(err) => {
+                self.status = format!("Error: {err}");
+                Err(err)
+            }
+        }
     }
 
     pub fn push_filter_char(&mut self, ch: char) {
@@ -223,7 +312,7 @@ impl TraceBrowserState {
 
     pub fn enter_filter_mode(&mut self) {
         self.filter_mode = true;
-        self.status = "Filter mode".to_string();
+        self.status = "Editing filter".to_string();
     }
 
     pub fn exit_filter_mode(&mut self) {
@@ -249,7 +338,7 @@ impl TraceBrowserState {
                     if !trace.archived {
                         self.archive_selected()?;
                     } else {
-                        self.status = "Selected trace is archived".to_string();
+                        self.status = "Error: selected trace is archived".to_string();
                     }
                 }
             }
@@ -258,7 +347,7 @@ impl TraceBrowserState {
                     if trace.archived {
                         self.restore_selected()?;
                     } else {
-                        self.status = "Selected trace is active".to_string();
+                        self.status = "Error: selected trace is active".to_string();
                     }
                 }
             }
@@ -344,7 +433,8 @@ impl TraceBrowserState {
             .constraints([
                 Constraint::Length(3),
                 Constraint::Min(10),
-                Constraint::Length(10),
+                Constraint::Min(6),
+                Constraint::Length(4),
             ])
             .split(frame.area());
 
@@ -369,56 +459,64 @@ impl TraceBrowserState {
         let traces = self.visible_traces();
         let selected = self.selection.min(traces.len().saturating_sub(1));
 
-        let header = Row::new(vec![
-            Cell::from("TRACE ID"),
-            Cell::from("STATUS"),
-            Cell::from("EXIT"),
-            Cell::from("DURATION"),
-            Cell::from("COMMAND"),
-        ])
-        .style(
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        );
-
-        let rows = traces.iter().enumerate().map(|(idx, trace)| {
-            let style = if idx == selected {
-                Style::default().fg(Color::Black).bg(Color::Yellow)
-            } else {
-                Style::default()
-            };
-
-            Row::new(vec![
-                Cell::from(trace.trace_id.clone()),
-                Cell::from(if trace.archived { "ARCHIVED" } else { "ACTIVE" }),
-                Cell::from(
-                    trace
-                        .exit_code
-                        .map(|code| code.to_string())
-                        .unwrap_or_else(|| "-".to_string()),
-                ),
-                Cell::from(format!("{}ms", trace.duration_ms)),
-                Cell::from(trace.command.clone()),
+        if let Some(message) = self.empty_state_message() {
+            let empty = Paragraph::new(message)
+                .alignment(Alignment::Center)
+                .block(Block::default().borders(Borders::ALL).title("Traces"))
+                .wrap(Wrap { trim: true });
+            frame.render_widget(empty, chunks[1]);
+        } else {
+            let header = Row::new(vec![
+                Cell::from("TRACE ID"),
+                Cell::from("STATUS"),
+                Cell::from("EXIT"),
+                Cell::from("DURATION"),
+                Cell::from("COMMAND"),
             ])
-            .style(style)
-        });
+            .style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            );
 
-        let table = Table::new(
-            rows,
-            [
-                Constraint::Length(42),
-                Constraint::Length(10),
-                Constraint::Length(8),
-                Constraint::Length(10),
-                Constraint::Min(20),
-            ],
-        )
-        .header(header)
-        .block(Block::default().borders(Borders::ALL).title("Traces"))
-        .column_spacing(1);
+            let rows = traces.iter().enumerate().map(|(idx, trace)| {
+                let style = if idx == selected {
+                    Style::default().fg(Color::Black).bg(Color::Yellow)
+                } else {
+                    Style::default()
+                };
 
-        frame.render_widget(table, chunks[1]);
+                Row::new(vec![
+                    Cell::from(trace.trace_id.clone()),
+                    Cell::from(if trace.archived { "ARCHIVED" } else { "ACTIVE" }),
+                    Cell::from(
+                        trace
+                            .exit_code
+                            .map(|code| code.to_string())
+                            .unwrap_or_else(|| "-".to_string()),
+                    ),
+                    Cell::from(format!("{}ms", trace.duration_ms)),
+                    Cell::from(trace.command.clone()),
+                ])
+                .style(style)
+            });
+
+            let table = Table::new(
+                rows,
+                [
+                    Constraint::Length(42),
+                    Constraint::Length(10),
+                    Constraint::Length(8),
+                    Constraint::Length(10),
+                    Constraint::Min(20),
+                ],
+            )
+            .header(header)
+            .block(Block::default().borders(Borders::ALL).title("Traces"))
+            .column_spacing(1);
+
+            frame.render_widget(table, chunks[1]);
+        }
 
         let detail_text = self
             .detail_text()
@@ -429,37 +527,15 @@ impl TraceBrowserState {
                     .unwrap_or_else(|| "No trace selected".to_string())
             });
 
-        let bottom = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(6), Constraint::Length(2)])
-            .split(chunks[2]);
-
         let detail = Paragraph::new(detail_text)
             .block(Block::default().borders(Borders::ALL).title("Detail"))
             .wrap(Wrap { trim: false });
-        frame.render_widget(detail, bottom[0]);
+        frame.render_widget(detail, chunks[2]);
 
-        let filter_label = "Filter: ";
-        let filter_text = if self.filter_mode {
-            format!("{filter_label}{}_", self.filter)
-        } else if self.filter.is_empty() {
-            "Filter: <empty>".to_string()
-        } else {
-            format!("Filter: {}", self.filter)
-        };
-
-        let help = if self.filter_mode {
-            "Enter apply | Esc cancel | Backspace delete"
-        } else {
-            "q quit | j/k or arrows move | Tab switch tab | Enter inspect | v verify | r report | a archive | u restore | / filter"
-        };
-
-        let footer = Paragraph::new(format!("{}    {}", filter_text, help)).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(self.status.clone()),
-        );
-        frame.render_widget(footer, bottom[1]);
+        let footer = Paragraph::new(self.footer_text())
+            .block(Block::default().borders(Borders::ALL).title("Footer"))
+            .wrap(Wrap { trim: true });
+        frame.render_widget(footer, chunks[3]);
     }
 }
 
@@ -478,11 +554,13 @@ fn build_summary_text(trace: &TraceSummary) -> String {
     )
 }
 
-fn build_verify_text(trace_root: &PathBuf, trace: &TraceSummary) -> Result<String> {
+fn build_verify_text(trace_root: &PathBuf, trace: &TraceSummary) -> Result<VerificationResult> {
     let store = FilesystemTraceStore::new(TraceStoreConfig::new(trace_root));
     let resolved = store.resolve_trace(&trace.trace_id)?;
     let manifest = store.load_manifest_at(&resolved.paths)?;
     let mut lines = Vec::new();
+    let mut ok = true;
+    let mut failure_reason = None;
 
     lines.push(format!("Trace ID: {}", trace.trace_id));
     lines.push(format!("Trace path: {}", resolved.paths.root.display()));
@@ -490,18 +568,46 @@ fn build_verify_text(trace_root: &PathBuf, trace: &TraceSummary) -> Result<Strin
     let manifest_hash = manifest_sha256_status(&resolved.paths)?;
     lines.push(format!(
         "Manifest: {}",
-        manifest_hash.unwrap_or_else(|| "unavailable".to_string())
+        manifest_hash
+            .clone()
+            .unwrap_or_else(|| "unavailable".to_string())
     ));
+    if matches!(manifest_hash.as_deref(), Some(text) if text.starts_with("FAILED")) {
+        ok = false;
+        failure_reason = Some("manifest checksum mismatch".to_string());
+    }
 
     let stdout_hash = verify_artifact(&resolved.paths.stdout, &manifest.integrity.stdout_sha256)?;
+    if !stdout_hash.ok {
+        ok = false;
+        failure_reason.get_or_insert(
+            stdout_hash
+                .reason
+                .clone()
+                .unwrap_or_else(|| "stdout hash mismatch".to_string()),
+        );
+    }
     let stderr_hash = verify_artifact(&resolved.paths.stderr, &manifest.integrity.stderr_sha256)?;
+    if !stderr_hash.ok {
+        ok = false;
+        failure_reason.get_or_insert(
+            stderr_hash
+                .reason
+                .clone()
+                .unwrap_or_else(|| "stderr hash mismatch".to_string()),
+        );
+    }
 
-    lines.push(format!("stdout: {stdout_hash}"));
-    lines.push(format!("stderr: {stderr_hash}"));
+    lines.push(format!("stdout: {}", stdout_hash.rendered));
+    lines.push(format!("stderr: {}", stderr_hash.rendered));
 
-    lines.push("Status: OK".to_string());
+    lines.push(format!("Status: {}", if ok { "OK" } else { "FAILED" }));
 
-    Ok(lines.join("\n"))
+    Ok(VerificationResult {
+        ok,
+        text: lines.join("\n"),
+        failure_reason,
+    })
 }
 
 fn manifest_sha256_status(paths: &crate::evidence::store::TracePaths) -> Result<Option<String>> {
@@ -529,12 +635,40 @@ fn manifest_sha256_status(paths: &crate::evidence::store::TracePaths) -> Result<
     }
 }
 
-fn verify_artifact(path: &Path, expected: &str) -> Result<String> {
+fn verify_artifact(path: &Path, expected: &str) -> Result<ArtifactVerification> {
     let actual = sha256_file(path)?;
     if actual == expected {
-        Ok("OK".to_string())
+        Ok(ArtifactVerification {
+            ok: true,
+            rendered: "OK".to_string(),
+            reason: None,
+        })
     } else {
-        Ok(format!("FAILED (expected {expected}, actual {actual})"))
+        Ok(ArtifactVerification {
+            ok: false,
+            rendered: format!("FAILED (expected {expected}, actual {actual})"),
+            reason: Some(format!("{} hash mismatch", path.display())),
+        })
+    }
+}
+
+impl TraceBrowserState {
+    fn status_line(&self) -> String {
+        if self.status.is_empty() {
+            "Status: none".to_string()
+        } else {
+            format!("Status: {}", self.status)
+        }
+    }
+
+    fn filter_line(&self) -> String {
+        if self.filter_mode {
+            format!("Filter: {}_", self.filter)
+        } else if self.filter.is_empty() {
+            "Filter: none".to_string()
+        } else {
+            format!("Filter: {}", self.filter)
+        }
     }
 }
 
@@ -603,7 +737,8 @@ mod tests {
         )?;
         fs::write(root.join("stdout.log"), "")?;
         fs::write(root.join("stderr.log"), "")?;
-        fs::write(root.join("manifest.sha256"), "dummy\n")?;
+        let manifest_hash = sha256_file(&root.join("manifest.json"))?;
+        fs::write(root.join("manifest.sha256"), format!("{manifest_hash}\n"))?;
         Ok(root)
     }
 
@@ -627,6 +762,39 @@ mod tests {
             .any(|trace| trace.trace_path.ends_with("archive")));
         assert!(active.exists());
         assert!(archived.exists());
+
+        Ok(())
+    }
+
+    #[test]
+    fn footer_help_text_is_present_in_state_model() -> Result<()> {
+        let temp = TempDir::new()?;
+        let state = TraceBrowserState::load(temp.path().join(".traces"))?;
+
+        assert_eq!(state.status_text(), "Filter: none | Status: Ready");
+        assert_eq!(state.keys_text(), HELP_FOOTER);
+        assert!(state.footer_text().contains("Filter: none | Status: Ready"));
+        assert!(state.footer_text().contains("q quit |"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn empty_active_and_archived_states_do_not_panic() -> Result<()> {
+        let temp = TempDir::new()?;
+        let mut state = TraceBrowserState::load(temp.path().join(".traces"))?;
+
+        assert_eq!(
+            state.empty_state_message(),
+            Some("No active traces found".to_string())
+        );
+        assert_eq!(state.status_text(), "Filter: none | Status: Ready");
+
+        state.switch_tab();
+        assert_eq!(
+            state.empty_state_message(),
+            Some("No archived traces found".to_string())
+        );
 
         Ok(())
     }
@@ -726,6 +894,82 @@ mod tests {
         let filtered_id = catalog.filtered_for_tab(TraceTab::Active, "trc_alpha");
         assert_eq!(filtered_id.len(), 1);
         assert_eq!(filtered_id[0].trace_id, "trc_alpha");
+
+        Ok(())
+    }
+
+    #[test]
+    fn no_match_filter_shows_empty_state() -> Result<()> {
+        let temp = TempDir::new()?;
+        let root = temp.path().join(".traces");
+        fs::create_dir_all(&root)?;
+        let _ = create_trace(temp.path(), "trc_alpha", false)?;
+
+        let mut state = TraceBrowserState::load(root)?;
+        state.set_filter("does-not-match");
+
+        assert_eq!(
+            state.empty_state_message(),
+            Some("No traces match filter".to_string())
+        );
+        assert_eq!(
+            state.status_text(),
+            "Filter: does-not-match | Status: Ready"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn detail_text_includes_command_and_path() -> Result<()> {
+        let temp = TempDir::new()?;
+        let root = temp.path().join(".traces");
+        fs::create_dir_all(&root)?;
+        let _ = create_trace(temp.path(), "trc_detail", false)?;
+
+        let state = TraceBrowserState::load(root)?;
+        let mut state = state;
+        state.inspect_selected()?;
+        let detail = state.detail_text().unwrap_or("");
+
+        assert!(detail.contains("Command: echo hello"));
+        assert!(detail.contains("Path:"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn report_verify_archive_and_restore_set_status_messages() -> Result<()> {
+        let temp = TempDir::new()?;
+        let root = temp.path().to_path_buf();
+        let _trace_path = create_trace(temp.path(), "trc_action", false)?;
+        let mut state = TraceBrowserState::load(root.join(".traces"))?;
+
+        state.report_selected()?;
+        assert!(state.status().starts_with("Report written: "));
+        assert!(state.status_text().contains("Status: Report written: "));
+
+        state.verify_selected()?;
+        assert_eq!(state.status(), "Verification: OK");
+        assert_eq!(
+            state.status_text(),
+            "Filter: none | Status: Verification: OK"
+        );
+
+        state.archive_selected()?;
+        assert_eq!(state.status(), "Archived trace: trc_action");
+        assert_eq!(
+            state.status_text(),
+            "Filter: none | Status: Archived trace: trc_action"
+        );
+
+        state.switch_tab();
+        state.restore_selected()?;
+        assert_eq!(state.status(), "Restored trace: trc_action");
+        assert_eq!(
+            state.status_text(),
+            "Filter: none | Status: Restored trace: trc_action"
+        );
 
         Ok(())
     }
