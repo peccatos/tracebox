@@ -33,7 +33,7 @@ pub fn execute(trace_root: PathBuf, trace_id: String, output: Option<PathBuf>) -
     Ok(())
 }
 
-fn build_report(
+pub(crate) fn build_report(
     trace_path: &Path,
     manifest: &TraceManifest,
     paths: &crate::evidence::store::TracePaths,

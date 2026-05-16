@@ -5,5 +5,7 @@ pub mod list;
 pub mod report;
 pub mod restore;
 pub mod run;
+#[cfg(feature = "tui")]
+pub mod tui;
 pub mod validate;
 pub mod verify;
