@@ -36,7 +36,11 @@ pub fn execute(trace_root: PathBuf, trace_id: String, json_output: bool) -> Resu
             trace_id,
             trace_path: verification.trace_path.clone(),
             status: if all_ok { "OK" } else { "FAILED" },
-            reason: None,
+            reason: if all_ok {
+                None
+            } else {
+                verification.first_failure_reason()
+            },
             checks: verification
                 .checks
                 .iter()
@@ -46,7 +50,21 @@ pub fn execute(trace_root: PathBuf, trace_id: String, json_output: bool) -> Resu
 
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
-        print!("{}", verification.render_text());
+        println!("Trace ID: {}", verification.trace_id);
+        println!("Trace path: {}", verification.trace_path);
+        if all_ok {
+            println!("Status: OK");
+        } else {
+            println!("Status: FAILED");
+            if let Some(reason) = verification.first_failure_reason() {
+                println!("Reason: {reason}");
+            }
+        }
+        println!();
+        println!("Checks:");
+        for check in &verification.checks {
+            print_check(check);
+        }
     }
 
     if all_ok {
@@ -134,19 +152,22 @@ impl VerificationSummary {
         self.checks.iter().all(VerificationCheck::is_ok)
     }
 
+    pub(crate) fn first_failure_reason(&self) -> Option<String> {
+        self.checks
+            .iter()
+            .find(|check| !check.is_ok())
+            .map(verification_check_reason)
+    }
+}
+
+#[cfg(feature = "tui")]
+impl VerificationSummary {
     pub(crate) fn status(&self) -> &'static str {
         if self.all_ok() {
             "OK"
         } else {
             "FAILED"
         }
-    }
-
-    pub(crate) fn first_failure_reason(&self) -> Option<String> {
-        self.checks
-            .iter()
-            .find(|check| !check.is_ok())
-            .map(verification_check_reason)
     }
 
     pub(crate) fn render_text(&self) -> String {
@@ -445,6 +466,26 @@ fn resolve_artifact_path(trace_dir: &Path, relative_path: &str) -> Result<PathBu
     }
 
     Ok(trace_dir.join(path))
+}
+
+fn print_check(check: &VerificationCheck) {
+    println!("  {}: {}", check.label, check.status.as_str());
+
+    if let Some(path) = &check.path {
+        println!("    path: {}", path.display());
+    }
+
+    if let Some(expected) = &check.expected {
+        println!("    expected: {expected}");
+    }
+
+    if let Some(actual) = &check.actual {
+        println!("    actual:   {actual}");
+    }
+
+    if let Some(detail) = &check.detail {
+        println!("    detail:   {detail}");
+    }
 }
 
 fn verification_check_reason(check: &VerificationCheck) -> String {
