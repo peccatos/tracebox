@@ -1,3 +1,4 @@
+pub mod browser;
 pub mod env;
 pub mod event;
 pub mod ids;

@@ -68,6 +68,11 @@ fn main() -> Result<()> {
             tracebox::commands::restore::execute(cli.trace_root, trace_id)?;
         }
 
+        #[cfg(feature = "tui")]
+        Commands::Tui => {
+            tracebox::commands::tui::execute(cli.trace_root)?;
+        }
+
         Commands::Diff { left, right, json } => {
             tracebox::commands::diff::execute(cli.trace_root, left, right, json)?;
         }

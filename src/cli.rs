@@ -126,6 +126,10 @@ pub enum Commands {
         trace_id: String,
     },
 
+    #[cfg(feature = "tui")]
+    /// Interactive trace browser.
+    Tui,
+
     /// Compare two traces.
     Diff {
         /// Left/base trace ID.
