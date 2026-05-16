@@ -36,15 +36,5 @@ jobs:
         with:
           name: tracebox-ci-evidence
           path: .traces/
+          include-hidden-files: true
           if-no-files-found: ignore
-
-      - name: Upload Tracebox evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-        name: tracebox-ci-evidence
-        path: .traces/
-        include-hidden-files: true
-        if-no-files-found: ignore
-
-
