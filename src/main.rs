@@ -48,12 +48,24 @@ fn main() -> Result<()> {
             std::process::exit(exit_code);
         }
 
-        Commands::List { json } => {
-            tracebox::commands::list::execute(cli.trace_root, json)?;
+        Commands::List {
+            json,
+            archived,
+            all,
+        } => {
+            tracebox::commands::list::execute(cli.trace_root, json, archived, all)?;
         }
 
         Commands::Report { trace_id, output } => {
             tracebox::commands::report::execute(cli.trace_root, trace_id, output)?;
+        }
+
+        Commands::Archive { trace_id } => {
+            tracebox::commands::archive::execute(cli.trace_root, trace_id)?;
+        }
+
+        Commands::Restore { trace_id } => {
+            tracebox::commands::restore::execute(cli.trace_root, trace_id)?;
         }
 
         Commands::Diff { left, right, json } => {

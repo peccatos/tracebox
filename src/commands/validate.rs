@@ -13,7 +13,8 @@ use crate::evidence::validation::{validate_manifest, ValidationCheck, Validation
 /// `crate::evidence::validation` so it can be reused by non-CLI integrations.
 pub fn execute(trace_root: PathBuf, trace_id: String, json_output: bool) -> Result<i32> {
     let store = FilesystemTraceStore::new(TraceStoreConfig::new(&trace_root));
-    let paths = store.paths_for(&trace_id);
+    let resolved = store.resolve_trace(&trace_id)?;
+    let paths = resolved.paths;
 
     if !paths.root.is_dir() {
         let report =

@@ -9,13 +9,14 @@ use crate::evidence::store::{FilesystemTraceStore, TraceStoreConfig};
 
 pub fn execute(trace_root: PathBuf, trace_id: String, output: Option<PathBuf>) -> Result<()> {
     let store = FilesystemTraceStore::new(TraceStoreConfig::new(&trace_root));
-    let paths = store.paths_for(&trace_id);
+    let resolved = store.resolve_trace(&trace_id)?;
+    let paths = resolved.paths;
 
     if !paths.root.is_dir() {
         bail!("trace directory does not exist: {}", paths.root.display());
     }
 
-    let manifest = store.load_manifest(&trace_id)?;
+    let manifest = store.load_manifest_at(&paths)?;
     let report_path = output.unwrap_or_else(|| paths.root.join("report.md"));
     let report = build_report(&paths.root, &manifest, &paths)?;
 

@@ -92,6 +92,14 @@ pub enum Commands {
         /// Emit JSON instead of a human table.
         #[arg(long)]
         json: bool,
+
+        /// Show archived traces only.
+        #[arg(long, conflicts_with_all = ["all"])]
+        archived: bool,
+
+        /// Show active and archived traces.
+        #[arg(long, conflicts_with_all = ["archived"])]
+        all: bool,
     },
 
     /// Generate a markdown report for a trace.
@@ -104,6 +112,18 @@ pub enum Commands {
         /// Defaults to `.traces/<trace-id>/report.md`.
         #[arg(long)]
         output: Option<PathBuf>,
+    },
+
+    /// Archive an active trace bundle.
+    Archive {
+        /// Trace ID, for example `trc_019...`.
+        trace_id: String,
+    },
+
+    /// Restore an archived trace bundle.
+    Restore {
+        /// Trace ID, for example `trc_019...`.
+        trace_id: String,
     },
 
     /// Compare two traces.

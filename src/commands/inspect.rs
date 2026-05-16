@@ -15,8 +15,9 @@ pub fn execute(
     json_output: bool,
 ) -> Result<()> {
     let store = FilesystemTraceStore::new(TraceStoreConfig::new(&trace_root));
-    let paths = store.paths_for(&trace_id);
-    let manifest = store.load_manifest(&trace_id)?;
+    let resolved = store.resolve_trace(&trace_id)?;
+    let paths = resolved.paths;
+    let manifest = store.load_manifest_at(&paths)?;
 
     let should_show_stderr_by_default =
         !show_stdout && !show_stderr && file_nonempty(&paths.stderr);
