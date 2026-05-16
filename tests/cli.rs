@@ -230,6 +230,110 @@ fn list_prints_created_trace_ids() -> Result<()> {
 }
 
 #[test]
+fn report_writes_markdown_file_by_default() -> Result<()> {
+    let temp = TempDir::new()?;
+
+    let mut run = Command::cargo_bin("tracebox")?;
+    run.current_dir(temp.path()).args([
+        "run",
+        "--",
+        "sh",
+        "-c",
+        "echo ok && echo err >&2 && exit 7",
+    ]);
+    run.assert().code(7);
+
+    let trace_dir = single_trace_dir(temp.path())?;
+    let trace_id = trace_dir
+        .file_name()
+        .context("trace directory should have a file name")?
+        .to_string_lossy()
+        .to_string();
+
+    let mut report = Command::cargo_bin("tracebox")?;
+    report
+        .current_dir(temp.path())
+        .args(["report", &trace_id])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Report written:"));
+
+    let report_path = trace_dir.join("report.md");
+    let report_text = fs::read_to_string(&report_path)
+        .with_context(|| format!("failed to read {}", report_path.display()))?;
+
+    assert!(report_text.contains(&trace_id));
+    assert!(report_text.contains("## Summary"));
+    assert!(report_text.contains("## Command"));
+    assert!(report_text.contains("## Exit status"));
+    assert!(report_text.contains("## Artifacts"));
+    assert!(report_text.contains("echo ok && echo err >&2 && exit 7"));
+    assert!(report_text.contains("Exit code"));
+    assert!(report_text.contains("stdout path"));
+    assert!(report_text.contains("stderr path"));
+    assert!(report_text.contains("non-zero exit code: 7"));
+
+    Ok(())
+}
+
+#[test]
+fn report_supports_custom_output_path() -> Result<()> {
+    let temp = TempDir::new()?;
+
+    let mut run = Command::cargo_bin("tracebox")?;
+    run.current_dir(temp.path())
+        .args(["run", "--", "sh", "-c", "printf custom"]);
+    run.assert().success();
+
+    let trace_dir = single_trace_dir(temp.path())?;
+    let trace_id = trace_dir
+        .file_name()
+        .context("trace directory should have a file name")?
+        .to_string_lossy()
+        .to_string();
+
+    let output_path = temp.path().join("nested").join("trace-report.md");
+
+    let mut report = Command::cargo_bin("tracebox")?;
+    report
+        .current_dir(temp.path())
+        .args([
+            "report",
+            &trace_id,
+            "--output",
+            output_path
+                .to_str()
+                .context("output path should be valid UTF-8")?,
+        ])
+        .assert()
+        .success();
+
+    assert!(output_path.is_file());
+
+    let report_text = fs::read_to_string(&output_path)
+        .with_context(|| format!("failed to read {}", output_path.display()))?;
+
+    assert!(report_text.contains(&trace_id));
+    assert!(report_text.contains("## Diagnosis hints"));
+
+    Ok(())
+}
+
+#[test]
+fn report_returns_clean_error_for_missing_trace() -> Result<()> {
+    let temp = TempDir::new()?;
+
+    Command::cargo_bin("tracebox")?
+        .current_dir(temp.path())
+        .args(["report", "trc_missing"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("trace directory does not exist"));
+
+    Ok(())
+}
+
+#[test]
 fn workspace_mutations_are_detected_from_before_after_git_snapshots() -> Result<()> {
     let temp = TempDir::new()?;
 
