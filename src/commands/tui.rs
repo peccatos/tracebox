@@ -45,7 +45,9 @@ pub struct TraceBrowserState {
     trace_root: PathBuf,
     catalog: TraceCatalog,
     tab: TraceTab,
-    selection: usize,
+    selected_index: usize,
+    scroll_offset: usize,
+    viewport_rows: usize,
     filter: String,
     filter_mode: bool,
     detail: DetailView,
@@ -66,7 +68,9 @@ impl TraceBrowserState {
             trace_root,
             catalog,
             tab: TraceTab::Active,
-            selection: 0,
+            selected_index: 0,
+            scroll_offset: 0,
+            viewport_rows: 0,
             filter: String::new(),
             filter_mode: false,
             detail: DetailView::Help,
@@ -76,7 +80,7 @@ impl TraceBrowserState {
 
     pub fn refresh(&mut self) -> Result<()> {
         self.catalog = load_trace_catalog(&self.trace_root)?;
-        self.clamp_selection();
+        self.clamp_selection_and_scroll();
         Ok(())
     }
 
@@ -85,7 +89,7 @@ impl TraceBrowserState {
     }
 
     pub fn selected_trace(&self) -> Option<&TraceSummary> {
-        self.visible_traces().get(self.selection).copied()
+        self.visible_traces().get(self.selected_index).copied()
     }
 
     pub fn filter_text(&self) -> &str {
@@ -97,7 +101,28 @@ impl TraceBrowserState {
     }
 
     pub fn selection(&self) -> usize {
-        self.selection
+        self.selected_index
+    }
+
+    pub fn selected_index(&self) -> usize {
+        self.selected_index
+    }
+
+    pub fn scroll_offset(&self) -> usize {
+        self.scroll_offset
+    }
+
+    pub fn local_selected_index(&self) -> Option<usize> {
+        if self.visible_traces().is_empty() {
+            None
+        } else {
+            Some(self.selected_index.saturating_sub(self.scroll_offset))
+        }
+    }
+
+    pub fn set_viewport_rows(&mut self, rows: usize) {
+        self.viewport_rows = rows;
+        self.clamp_selection_and_scroll();
     }
 
     pub fn status(&self) -> &str {
@@ -140,32 +165,33 @@ impl TraceBrowserState {
 
     pub fn set_filter(&mut self, filter: impl Into<String>) {
         self.filter = filter.into();
-        self.selection = 0;
+        self.clamp_selection_and_scroll();
     }
 
     pub fn switch_tab(&mut self) {
         self.tab = self.tab.toggle();
-        self.selection = 0;
         self.detail = DetailView::Help;
+        self.clamp_selection_and_scroll();
     }
 
     pub fn move_selection(&mut self, offset: isize) {
-        let traces = self.visible_traces();
-
-        if traces.is_empty() {
-            self.selection = 0;
+        let len = self.visible_traces().len();
+        if len == 0 {
+            self.selected_index = 0;
+            self.scroll_offset = 0;
             return;
         }
 
-        let len = traces.len() as isize;
-        let mut next = self.selection as isize + offset;
+        let len_isize = len as isize;
+        let mut next = self.selected_index as isize + offset;
         if next < 0 {
             next = 0;
         }
-        if next >= len {
-            next = len - 1;
+        if next >= len_isize {
+            next = len_isize - 1;
         }
-        self.selection = next as usize;
+        self.selected_index = next as usize;
+        self.clamp_selection_and_scroll();
     }
 
     pub fn inspect_selected(&mut self) -> Result<()> {
@@ -281,12 +307,12 @@ impl TraceBrowserState {
 
     pub fn push_filter_char(&mut self, ch: char) {
         self.filter.push(ch);
-        self.selection = 0;
+        self.clamp_selection_and_scroll();
     }
 
     pub fn pop_filter_char(&mut self) {
         self.filter.pop();
-        self.selection = 0;
+        self.clamp_selection_and_scroll();
     }
 
     pub fn enter_filter_mode(&mut self) {
@@ -296,7 +322,7 @@ impl TraceBrowserState {
 
     pub fn exit_filter_mode(&mut self) {
         self.filter_mode = false;
-        self.clamp_selection();
+        self.clamp_selection_and_scroll();
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
@@ -361,12 +387,33 @@ impl TraceBrowserState {
         Ok(false)
     }
 
-    fn clamp_selection(&mut self) {
+    fn clamp_selection_and_scroll(&mut self) {
         let len = self.visible_traces().len();
         if len == 0 {
-            self.selection = 0;
-        } else if self.selection >= len {
-            self.selection = len - 1;
+            self.selected_index = 0;
+            self.scroll_offset = 0;
+            return;
+        }
+
+        if self.selected_index >= len {
+            self.selected_index = len - 1;
+        }
+
+        let viewport_rows = self.viewport_rows.max(1).min(len);
+        let max_offset = len.saturating_sub(viewport_rows);
+
+        if self.scroll_offset > max_offset {
+            self.scroll_offset = max_offset;
+        }
+
+        if self.selected_index < self.scroll_offset {
+            self.scroll_offset = self.selected_index;
+        } else if self.selected_index >= self.scroll_offset + viewport_rows {
+            self.scroll_offset = self.selected_index + 1 - viewport_rows;
+        }
+
+        if self.scroll_offset > max_offset {
+            self.scroll_offset = max_offset;
         }
     }
 
@@ -406,7 +453,7 @@ impl TraceBrowserState {
     }
 
     #[cfg(feature = "tui")]
-    fn draw(&self, frame: &mut Frame) {
+    fn draw(&mut self, frame: &mut Frame) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -435,8 +482,10 @@ impl TraceBrowserState {
             );
         frame.render_widget(tabs, chunks[0]);
 
+        self.viewport_rows = chunks[1].height.saturating_sub(3) as usize;
+        self.clamp_selection_and_scroll();
+
         let traces = self.visible_traces();
-        let selected = self.selection.min(traces.len().saturating_sub(1));
 
         if let Some(message) = self.empty_state_message() {
             let empty = Paragraph::new(message)
@@ -458,27 +507,37 @@ impl TraceBrowserState {
                     .add_modifier(Modifier::BOLD),
             );
 
-            let rows = traces.iter().enumerate().map(|(idx, trace)| {
-                let style = if idx == selected {
-                    Style::default().fg(Color::Black).bg(Color::Yellow)
-                } else {
-                    Style::default()
-                };
+            let local_selected = self
+                .local_selected_index()
+                .unwrap_or(0)
+                .min(self.viewport_rows.saturating_sub(1));
 
-                Row::new(vec![
-                    Cell::from(trace.trace_id.clone()),
-                    Cell::from(if trace.archived { "ARCHIVED" } else { "ACTIVE" }),
-                    Cell::from(
-                        trace
-                            .exit_code
-                            .map(|code| code.to_string())
-                            .unwrap_or_else(|| "-".to_string()),
-                    ),
-                    Cell::from(format!("{}ms", trace.duration_ms)),
-                    Cell::from(trace.command.clone()),
-                ])
-                .style(style)
-            });
+            let rows = traces
+                .iter()
+                .skip(self.scroll_offset)
+                .take(self.viewport_rows)
+                .enumerate()
+                .map(|(idx, trace)| {
+                    let style = if idx == local_selected {
+                        Style::default().fg(Color::Black).bg(Color::Yellow)
+                    } else {
+                        Style::default()
+                    };
+
+                    Row::new(vec![
+                        Cell::from(trace.trace_id.clone()),
+                        Cell::from(if trace.archived { "ARCHIVED" } else { "ACTIVE" }),
+                        Cell::from(
+                            trace
+                                .exit_code
+                                .map(|code| code.to_string())
+                                .unwrap_or_else(|| "-".to_string()),
+                        ),
+                        Cell::from(format!("{}ms", trace.duration_ms)),
+                        Cell::from(trace.command.clone()),
+                    ])
+                    .style(style)
+                });
 
             let table = Table::new(
                 rows,
@@ -960,6 +1019,128 @@ mod tests {
         state.verify_selected()?;
         assert_eq!(state.status(), "Verification: OK");
         assert!(state.detail_text().unwrap_or("").contains("Status: OK"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn moving_down_beyond_visible_height_increases_scroll_offset() -> Result<()> {
+        let temp = TempDir::new()?;
+        let root = temp.path().join(".traces");
+        fs::create_dir_all(&root)?;
+        for idx in 0..5 {
+            let trace_id = format!("trc_{idx}");
+            let _ = create_trace(temp.path(), &trace_id, false, true, PtyFixture::None)?;
+        }
+
+        let mut state = TraceBrowserState::load(root)?;
+        state.set_viewport_rows(2);
+
+        state.move_selection(1);
+        assert_eq!(state.selected_index(), 1);
+        assert_eq!(state.scroll_offset(), 0);
+
+        state.move_selection(1);
+        assert_eq!(state.selected_index(), 2);
+        assert_eq!(state.scroll_offset(), 1);
+
+        state.move_selection(1);
+        assert_eq!(state.selected_index(), 3);
+        assert_eq!(state.scroll_offset(), 2);
+
+        Ok(())
+    }
+
+    #[test]
+    fn moving_up_above_viewport_decreases_scroll_offset() -> Result<()> {
+        let temp = TempDir::new()?;
+        let root = temp.path().join(".traces");
+        fs::create_dir_all(&root)?;
+        for idx in 0..5 {
+            let trace_id = format!("trc_{idx}");
+            let _ = create_trace(temp.path(), &trace_id, false, true, PtyFixture::None)?;
+        }
+
+        let mut state = TraceBrowserState::load(root)?;
+        state.set_viewport_rows(2);
+        state.move_selection(4);
+        assert_eq!(state.selected_index(), 4);
+        assert_eq!(state.scroll_offset(), 3);
+
+        state.move_selection(-2);
+        assert_eq!(state.selected_index(), 2);
+        assert_eq!(state.scroll_offset(), 2);
+
+        state.move_selection(-1);
+        assert_eq!(state.selected_index(), 1);
+        assert_eq!(state.scroll_offset(), 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn local_selected_index_is_global_minus_scroll_offset() -> Result<()> {
+        let temp = TempDir::new()?;
+        let root = temp.path().join(".traces");
+        fs::create_dir_all(&root)?;
+        for idx in 0..4 {
+            let trace_id = format!("trc_{idx}");
+            let _ = create_trace(temp.path(), &trace_id, false, true, PtyFixture::None)?;
+        }
+
+        let mut state = TraceBrowserState::load(root)?;
+        state.set_viewport_rows(2);
+        state.move_selection(3);
+
+        assert_eq!(state.selected_index(), 3);
+        assert_eq!(state.scroll_offset(), 2);
+        assert_eq!(state.local_selected_index(), Some(1));
+
+        Ok(())
+    }
+
+    #[test]
+    fn filter_switch_archive_restore_and_empty_lists_clamp_scroll_state() -> Result<()> {
+        let temp = TempDir::new()?;
+        let root = temp.path().join(".traces");
+        fs::create_dir_all(&root)?;
+        for idx in 0..4 {
+            let trace_id = format!("trc_{idx}");
+            let _ = create_trace(temp.path(), &trace_id, false, true, PtyFixture::None)?;
+        }
+
+        let mut state = TraceBrowserState::load(root.clone())?;
+        state.set_viewport_rows(2);
+        state.move_selection(3);
+        assert_eq!(state.selected_index(), 3);
+        assert_eq!(state.scroll_offset(), 2);
+
+        state.set_filter("trc_0");
+        assert_eq!(state.selected_index(), 0);
+        assert_eq!(state.scroll_offset(), 0);
+
+        state.set_filter("");
+        state.switch_tab();
+        assert_eq!(state.selected_index(), 0);
+        assert_eq!(state.scroll_offset(), 0);
+
+        state = TraceBrowserState::load(root)?;
+        state.set_viewport_rows(2);
+        state.move_selection(1);
+        state.archive_selected()?;
+        assert_eq!(state.scroll_offset(), 0);
+        assert!(state.selected_index() < state.visible_traces().len().max(1));
+
+        state.switch_tab();
+        state.restore_selected()?;
+        assert_eq!(state.scroll_offset(), 0);
+        assert!(state.selected_index() < state.visible_traces().len().max(1));
+
+        let temp_empty = TempDir::new()?;
+        let mut empty_state = TraceBrowserState::load(temp_empty.path().join(".traces"))?;
+        empty_state.set_viewport_rows(2);
+        assert_eq!(empty_state.selected_index(), 0);
+        assert_eq!(empty_state.scroll_offset(), 0);
 
         Ok(())
     }
