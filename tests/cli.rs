@@ -354,6 +354,61 @@ fn report_returns_clean_error_for_missing_trace() -> Result<()> {
 }
 
 #[test]
+fn service_directories_are_never_treated_as_traces() -> Result<()> {
+    let temp = TempDir::new()?;
+
+    fs::create_dir_all(temp.path().join(".traces/archive"))?;
+
+    let mut run = Command::cargo_bin("tracebox")?;
+    run.current_dir(temp.path())
+        .args(["run", "--", "sh", "-c", "printf active"]);
+    run.assert().success();
+
+    let active_dir = single_trace_dir(temp.path())?;
+    let active_trace = active_dir
+        .file_name()
+        .context("active trace directory should have a file name")?
+        .to_string_lossy()
+        .to_string();
+
+    Command::cargo_bin("tracebox")?
+        .current_dir(temp.path())
+        .arg("list")
+        .output()
+        .map(|output| {
+            assert!(output.status.success());
+            let text = String::from_utf8(output.stdout).expect("valid UTF-8");
+            assert!(text.contains(&active_trace));
+            assert!(!text.contains("archive"));
+        })?;
+
+    for args in [
+        vec!["inspect", "archive"],
+        vec!["verify", "archive"],
+        vec!["validate", "archive"],
+        vec!["report", "archive"],
+        vec!["diff", "archive", &active_trace],
+    ] {
+        Command::cargo_bin("tracebox")?
+            .current_dir(temp.path())
+            .args(args)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("trace not found"));
+    }
+
+    Command::cargo_bin("tracebox")?
+        .current_dir(temp.path())
+        .args(["inspect", &active_trace])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Trace ID:"))
+        .stdout(predicate::str::contains(&active_trace));
+
+    Ok(())
+}
+
+#[test]
 fn archive_restore_and_archived_resolution_work_end_to_end() -> Result<()> {
     let temp = TempDir::new()?;
 
@@ -536,7 +591,9 @@ fn archive_and_restore_error_cases_are_clean() -> Result<()> {
         .args(["restore", &trace_id])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("trace is not archived"));
+        .stderr(predicate::str::contains(
+            "active destination already exists",
+        ));
 
     Command::cargo_bin("tracebox")?
         .current_dir(temp.path())

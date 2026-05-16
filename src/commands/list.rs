@@ -1,4 +1,3 @@
-use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -94,7 +93,11 @@ fn collect_traces(base_root: &Path, archived: bool, traces: &mut Vec<ListedTrace
             continue;
         }
 
-        if !archived && entry.file_name() == OsStr::new("archive") {
+        if is_reserved_trace_name(entry.file_name().to_str().unwrap_or_default()) {
+            continue;
+        }
+
+        if !is_trace_bundle_dir(&path) {
             continue;
         }
 
@@ -128,6 +131,14 @@ fn load_manifest(trace_path: &Path) -> Result<TraceManifest> {
         .with_context(|| format!("failed to parse {}", manifest_path.display()))?;
 
     Ok(manifest)
+}
+
+fn is_reserved_trace_name(name: &str) -> bool {
+    matches!(name, "archive" | "reports" | "tmp" | "index.json")
+}
+
+fn is_trace_bundle_dir(path: &Path) -> bool {
+    path.is_dir() && path.join("manifest.json").is_file()
 }
 
 fn empty_message(

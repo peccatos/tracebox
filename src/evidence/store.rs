@@ -7,6 +7,8 @@ use anyhow::{bail, Context, Result};
 use crate::evidence::integrity::{sha256_bytes, sha256_file};
 use crate::evidence::manifest::TraceManifest;
 
+const RESERVED_TRACE_NAMES: &[&str] = &["archive", "reports", "tmp", "index.json"];
+
 /// Filesystem storage configuration.
 ///
 /// The root should usually be:
@@ -98,16 +100,20 @@ impl FilesystemTraceStore {
     }
 
     pub fn trace_state(&self, trace_id: &str) -> TraceState {
-        let active = self.paths_for(trace_id).root.is_dir();
-        let archived = self.archived_paths_for(trace_id).root.is_dir();
+        let active = self.is_valid_trace_bundle(&self.paths_for(trace_id));
+        let archived = self.is_valid_trace_bundle(&self.archived_paths_for(trace_id));
 
         TraceState { active, archived }
     }
 
     pub fn resolve_trace(&self, trace_id: &str) -> Result<ResolvedTrace> {
+        if is_reserved_trace_name(trace_id) {
+            bail!("trace not found: {trace_id}");
+        }
+
         let active = self.paths_for(trace_id);
 
-        if active.root.is_dir() {
+        if self.is_valid_trace_bundle(&active) {
             return Ok(ResolvedTrace {
                 trace_id: trace_id.to_string(),
                 location: TraceLocation::Active,
@@ -117,7 +123,7 @@ impl FilesystemTraceStore {
 
         let archived = self.archived_paths_for(trace_id);
 
-        if archived.root.is_dir() {
+        if self.is_valid_trace_bundle(&archived) {
             return Ok(ResolvedTrace {
                 trace_id: trace_id.to_string(),
                 location: TraceLocation::Archived,
@@ -163,27 +169,31 @@ impl FilesystemTraceStore {
 
         let active = self.paths_for(trace_id);
         let archived = self.archived_paths_for(trace_id);
-        let state = self.trace_state(trace_id);
 
-        match (state.active, state.archived) {
-            (false, false) => bail!("trace not found: {trace_id}"),
-            (false, true) => bail!("trace is already archived: {trace_id}"),
-            (true, true) => bail!(
-                "archive destination already exists: {}",
-                archived.root.display()
-            ),
-            (true, false) => {
-                fs::rename(&active.root, &archived.root).with_context(|| {
-                    format!(
-                        "failed to move trace {} to {}",
-                        active.root.display(),
-                        archived.root.display()
-                    )
-                })?;
-
-                Ok(archived)
+        if self.is_valid_trace_bundle(&active) {
+            if archived.root.exists() {
+                bail!(
+                    "archive destination already exists: {}",
+                    archived.root.display()
+                );
             }
+
+            fs::rename(&active.root, &archived.root).with_context(|| {
+                format!(
+                    "failed to move trace {} to {}",
+                    active.root.display(),
+                    archived.root.display()
+                )
+            })?;
+
+            return Ok(archived);
         }
+
+        if self.is_valid_trace_bundle(&archived) {
+            bail!("trace is already archived: {trace_id}");
+        }
+
+        bail!("trace not found: {trace_id}")
     }
 
     pub fn restore_trace(&self, trace_id: &str) -> Result<TracePaths> {
@@ -193,27 +203,27 @@ impl FilesystemTraceStore {
 
         let active = self.paths_for(trace_id);
         let archived = self.archived_paths_for(trace_id);
-        let state = self.trace_state(trace_id);
 
-        match (state.active, state.archived) {
-            (false, false) => bail!("trace is not archived: {trace_id}"),
-            (true, false) => bail!("trace is not archived: {trace_id}"),
-            (true, true) => bail!(
+        if active.root.exists() {
+            bail!(
                 "active destination already exists: {}",
                 active.root.display()
-            ),
-            (false, true) => {
-                fs::rename(&archived.root, &active.root).with_context(|| {
-                    format!(
-                        "failed to move trace {} to {}",
-                        archived.root.display(),
-                        active.root.display()
-                    )
-                })?;
-
-                Ok(active)
-            }
+            );
         }
+
+        if self.is_valid_trace_bundle(&archived) {
+            fs::rename(&archived.root, &active.root).with_context(|| {
+                format!(
+                    "failed to move trace {} to {}",
+                    archived.root.display(),
+                    active.root.display()
+                )
+            })?;
+
+            return Ok(active);
+        }
+
+        bail!("trace is not archived: {trace_id}")
     }
 
     /// Open an artifact file with create-new semantics.
@@ -291,10 +301,32 @@ impl FilesystemTraceStore {
     pub fn artifact_hash(path: &Path) -> Result<String> {
         sha256_file(path)
     }
+
+    fn is_valid_trace_bundle(&self, paths: &TracePaths) -> bool {
+        if is_reserved_trace_name(
+            paths
+                .root
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default(),
+        ) {
+            return false;
+        }
+
+        is_trace_bundle_dir(&paths.root)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TraceState {
     pub active: bool,
     pub archived: bool,
+}
+
+fn is_reserved_trace_name(name: &str) -> bool {
+    RESERVED_TRACE_NAMES.contains(&name)
+}
+
+fn is_trace_bundle_dir(path: &Path) -> bool {
+    path.is_dir() && path.join("manifest.json").is_file()
 }
