@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
@@ -8,37 +9,56 @@ use predicates::prelude::*;
 use serde_json::Value;
 use tempfile::TempDir;
 
-/// Return the only trace directory created inside `.traces`.
+/// Return the only active trace directory created inside `.traces`.
 ///
 /// These tests intentionally inspect the filesystem, not internal Rust APIs.
 /// Tracebox is an evidence runtime; the storage layout is part of the external
 /// contract and must be tested end-to-end.
 fn single_trace_dir(workspace: &Path) -> Result<PathBuf> {
-    let traces_root = workspace.join(".traces");
-
-    let mut dirs = Vec::new();
-
-    for entry in fs::read_dir(&traces_root)
-        .with_context(|| format!("failed to read traces root: {}", traces_root.display()))?
-    {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-
-        if file_type.is_dir() {
-            dirs.push(entry.path());
-        }
-    }
-
-    dirs.sort();
+    let dirs = trace_dirs(workspace, false)?;
 
     assert_eq!(
         dirs.len(),
         1,
-        "expected exactly one trace directory in {}",
-        traces_root.display()
+        "expected exactly one active trace directory in {}",
+        workspace.join(".traces").display()
     );
 
-    Ok(dirs.remove(0))
+    Ok(dirs.into_iter().next().expect("single trace dir"))
+}
+
+fn trace_dirs(workspace: &Path, archived: bool) -> Result<Vec<PathBuf>> {
+    let root = if archived {
+        workspace.join(".traces/archive")
+    } else {
+        workspace.join(".traces")
+    };
+
+    let mut dirs = Vec::new();
+
+    if !root.exists() {
+        return Ok(dirs);
+    }
+
+    for entry in fs::read_dir(&root)
+        .with_context(|| format!("failed to read traces root: {}", root.display()))?
+    {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+
+        if !file_type.is_dir() {
+            continue;
+        }
+
+        if !archived && entry.file_name() == OsStr::new("archive") {
+            continue;
+        }
+
+        dirs.push(entry.path());
+    }
+
+    dirs.sort();
+    Ok(dirs)
 }
 
 /// Load `manifest.json` from a trace directory as generic JSON.
@@ -328,7 +348,220 @@ fn report_returns_clean_error_for_missing_trace() -> Result<()> {
         .args(["report", "trc_missing"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("trace directory does not exist"));
+        .stderr(predicate::str::contains("trace not found"));
+
+    Ok(())
+}
+
+#[test]
+fn archive_restore_and_archived_resolution_work_end_to_end() -> Result<()> {
+    let temp = TempDir::new()?;
+
+    let mut run = Command::cargo_bin("tracebox")?;
+    run.current_dir(temp.path())
+        .args(["run", "--", "sh", "-c", "echo archived && echo err >&2"]);
+    run.assert().success();
+
+    let trace_dir = single_trace_dir(temp.path())?;
+    let trace_id = trace_dir
+        .file_name()
+        .context("trace directory should have a file name")?
+        .to_string_lossy()
+        .to_string();
+
+    Command::cargo_bin("tracebox")?
+        .current_dir(temp.path())
+        .args(["archive", &trace_id])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Archived trace:"));
+
+    assert!(!trace_dir.exists());
+
+    let archived_dir = temp.path().join(".traces/archive").join(&trace_id);
+    assert!(archived_dir.is_dir());
+
+    let archived_dirs = trace_dirs(temp.path(), true)?;
+    assert_eq!(archived_dirs.len(), 1);
+    assert_eq!(archived_dirs[0], archived_dir);
+
+    Command::cargo_bin("tracebox")?
+        .current_dir(temp.path())
+        .args(["inspect", &trace_id])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Trace ID:"))
+        .stdout(predicate::str::contains(&trace_id));
+
+    Command::cargo_bin("tracebox")?
+        .current_dir(temp.path())
+        .args(["verify", &trace_id])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Status: OK"));
+
+    Command::cargo_bin("tracebox")?
+        .current_dir(temp.path())
+        .args(["validate", &trace_id])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Status: OK"));
+
+    Command::cargo_bin("tracebox")?
+        .current_dir(temp.path())
+        .args(["report", &trace_id])
+        .assert()
+        .success();
+
+    let report_path = archived_dir.join("report.md");
+    assert!(report_path.is_file());
+
+    let report_text = fs::read_to_string(&report_path)
+        .with_context(|| format!("failed to read {}", report_path.display()))?;
+
+    assert!(report_text.contains(&trace_id));
+    assert!(report_text.contains("## Diagnosis hints"));
+
+    Command::cargo_bin("tracebox")?
+        .current_dir(temp.path())
+        .args(["restore", &trace_id])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Restored trace:"));
+
+    assert!(temp.path().join(".traces").join(&trace_id).is_dir());
+    assert!(!archived_dir.exists());
+
+    Ok(())
+}
+
+#[test]
+fn list_modes_and_diff_work_across_active_and_archived_traces() -> Result<()> {
+    let temp = TempDir::new()?;
+
+    let mut first = Command::cargo_bin("tracebox")?;
+    first
+        .current_dir(temp.path())
+        .args(["run", "--", "sh", "-c", "printf first"]);
+    first.assert().success();
+
+    let mut second = Command::cargo_bin("tracebox")?;
+    second
+        .current_dir(temp.path())
+        .args(["run", "--", "sh", "-c", "printf second"]);
+    second.assert().success();
+
+    let trace_ids = trace_ids_from_list_json(temp.path(), false, false)?;
+    assert_eq!(trace_ids.len(), 2);
+
+    let archived_trace = &trace_ids[0];
+    let active_trace = &trace_ids[1];
+
+    Command::cargo_bin("tracebox")?
+        .current_dir(temp.path())
+        .args(["archive", archived_trace])
+        .assert()
+        .success();
+
+    let default_list = Command::cargo_bin("tracebox")?
+        .current_dir(temp.path())
+        .arg("list")
+        .output()?;
+
+    assert!(default_list.status.success());
+    let default_text = String::from_utf8(default_list.stdout)?;
+    assert!(default_text.contains(active_trace));
+    assert!(!default_text.contains(archived_trace));
+
+    let archived_list = Command::cargo_bin("tracebox")?
+        .current_dir(temp.path())
+        .args(["list", "--archived"])
+        .output()?;
+
+    assert!(archived_list.status.success());
+    let archived_text = String::from_utf8(archived_list.stdout)?;
+    assert!(archived_text.contains(archived_trace));
+    assert!(!archived_text.contains(active_trace));
+
+    let all_list = Command::cargo_bin("tracebox")?
+        .current_dir(temp.path())
+        .args(["list", "--all"])
+        .output()?;
+
+    assert!(all_list.status.success());
+    let all_text = String::from_utf8(all_list.stdout)?;
+    assert!(all_text.contains(active_trace));
+    assert!(all_text.contains(archived_trace));
+    assert!(all_text.contains("ARCHIVED"));
+    assert!(all_text.contains("ACTIVE"));
+
+    let diff_output = Command::cargo_bin("tracebox")?
+        .current_dir(temp.path())
+        .args(["diff", active_trace, archived_trace])
+        .output()?;
+
+    assert!(diff_output.status.success());
+    let diff_text = String::from_utf8(diff_output.stdout)?;
+    assert!(diff_text.contains(active_trace));
+    assert!(diff_text.contains(archived_trace));
+
+    Ok(())
+}
+
+#[test]
+fn archive_and_restore_error_cases_are_clean() -> Result<()> {
+    let temp = TempDir::new()?;
+
+    Command::cargo_bin("tracebox")?
+        .current_dir(temp.path())
+        .args(["archive", "trc_missing"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("trace not found"));
+
+    let mut run = Command::cargo_bin("tracebox")?;
+    run.current_dir(temp.path())
+        .args(["run", "--", "sh", "-c", "printf error-cases"]);
+    run.assert().success();
+
+    let trace_dir = single_trace_dir(temp.path())?;
+    let trace_id = trace_dir
+        .file_name()
+        .context("trace directory should have a file name")?
+        .to_string_lossy()
+        .to_string();
+
+    Command::cargo_bin("tracebox")?
+        .current_dir(temp.path())
+        .args(["restore", &trace_id])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("trace is not archived"));
+
+    Command::cargo_bin("tracebox")?
+        .current_dir(temp.path())
+        .args(["archive", &trace_id])
+        .assert()
+        .success();
+
+    Command::cargo_bin("tracebox")?
+        .current_dir(temp.path())
+        .args(["archive", &trace_id])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("trace is already archived"));
+
+    let active_dir = temp.path().join(".traces").join(&trace_id);
+    fs::create_dir_all(&active_dir)?;
+
+    Command::cargo_bin("tracebox")?
+        .current_dir(temp.path())
+        .args(["restore", &trace_id])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "active destination already exists",
+        ));
 
     Ok(())
 }
@@ -451,7 +684,7 @@ fn inspect_verify_and_diff_support_json_output() -> Result<()> {
         .args(["run", "--", "sh", "-c", "printf second && exit 3"]);
     second.assert().code(3);
 
-    let trace_ids = trace_ids_from_list_json(temp.path())?;
+    let trace_ids = trace_ids_from_list_json(temp.path(), false, false)?;
 
     assert_eq!(trace_ids.len(), 2);
 
@@ -578,11 +811,19 @@ fn validate_accepts_valid_trace_and_rejects_semantically_invalid_manifest() -> R
     Ok(())
 }
 
-fn trace_ids_from_list_json(workspace: &Path) -> Result<Vec<String>> {
-    let output = Command::cargo_bin("tracebox")?
-        .current_dir(workspace)
-        .args(["list", "--json"])
-        .output()?;
+fn trace_ids_from_list_json(workspace: &Path, archived: bool, all: bool) -> Result<Vec<String>> {
+    let mut cmd = Command::cargo_bin("tracebox")?;
+    cmd.current_dir(workspace).arg("list").arg("--json");
+
+    if archived {
+        cmd.arg("--archived");
+    }
+
+    if all {
+        cmd.arg("--all");
+    }
+
+    let output = cmd.output()?;
 
     assert!(output.status.success());
 

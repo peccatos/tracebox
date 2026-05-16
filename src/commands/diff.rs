@@ -10,8 +10,11 @@ use crate::evidence::store::{FilesystemTraceStore, TraceStoreConfig};
 pub fn execute(trace_root: PathBuf, left: String, right: String, json_output: bool) -> Result<()> {
     let store = FilesystemTraceStore::new(TraceStoreConfig::new(&trace_root));
 
-    let left_manifest = store.load_manifest(&left)?;
-    let right_manifest = store.load_manifest(&right)?;
+    let left_resolved = store.resolve_trace(&left)?;
+    let right_resolved = store.resolve_trace(&right)?;
+
+    let left_manifest = store.load_manifest_at(&left_resolved.paths)?;
+    let right_manifest = store.load_manifest_at(&right_resolved.paths)?;
 
     if json_output {
         let output = json_diff(&left_manifest, &right_manifest);

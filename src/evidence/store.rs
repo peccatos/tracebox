@@ -36,6 +36,19 @@ pub struct TracePaths {
     pub pty: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TraceLocation {
+    Active,
+    Archived,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedTrace {
+    pub trace_id: String,
+    pub location: TraceLocation,
+    pub paths: TracePaths,
+}
+
 /// Minimal append-only filesystem store.
 ///
 /// This type intentionally does not know anything about process execution. It
@@ -67,6 +80,54 @@ impl FilesystemTraceStore {
         }
     }
 
+    pub fn archived_paths_for(&self, trace_id: &str) -> TracePaths {
+        let root = self.archive_root().join(trace_id);
+
+        TracePaths {
+            manifest: root.join("manifest.json"),
+            manifest_sha256: root.join("manifest.sha256"),
+            stdout: root.join("stdout.log"),
+            stderr: root.join("stderr.log"),
+            pty: root.join("pty.log"),
+            root,
+        }
+    }
+
+    pub fn archive_root(&self) -> PathBuf {
+        self.config.root.join("archive")
+    }
+
+    pub fn trace_state(&self, trace_id: &str) -> TraceState {
+        let active = self.paths_for(trace_id).root.is_dir();
+        let archived = self.archived_paths_for(trace_id).root.is_dir();
+
+        TraceState { active, archived }
+    }
+
+    pub fn resolve_trace(&self, trace_id: &str) -> Result<ResolvedTrace> {
+        let active = self.paths_for(trace_id);
+
+        if active.root.is_dir() {
+            return Ok(ResolvedTrace {
+                trace_id: trace_id.to_string(),
+                location: TraceLocation::Active,
+                paths: active,
+            });
+        }
+
+        let archived = self.archived_paths_for(trace_id);
+
+        if archived.root.is_dir() {
+            return Ok(ResolvedTrace {
+                trace_id: trace_id.to_string(),
+                location: TraceLocation::Archived,
+                paths: archived,
+            });
+        }
+
+        bail!("trace not found: {trace_id}")
+    }
+
     /// Create a new immutable trace directory.
     ///
     /// `create_dir` is used for the final trace directory so accidental trace ID
@@ -90,6 +151,69 @@ impl FilesystemTraceStore {
         })?;
 
         Ok(paths)
+    }
+
+    pub fn archive_trace(&self, trace_id: &str) -> Result<TracePaths> {
+        fs::create_dir_all(self.archive_root()).with_context(|| {
+            format!(
+                "failed to create archive root {}",
+                self.archive_root().display()
+            )
+        })?;
+
+        let active = self.paths_for(trace_id);
+        let archived = self.archived_paths_for(trace_id);
+        let state = self.trace_state(trace_id);
+
+        match (state.active, state.archived) {
+            (false, false) => bail!("trace not found: {trace_id}"),
+            (false, true) => bail!("trace is already archived: {trace_id}"),
+            (true, true) => bail!(
+                "archive destination already exists: {}",
+                archived.root.display()
+            ),
+            (true, false) => {
+                fs::rename(&active.root, &archived.root).with_context(|| {
+                    format!(
+                        "failed to move trace {} to {}",
+                        active.root.display(),
+                        archived.root.display()
+                    )
+                })?;
+
+                Ok(archived)
+            }
+        }
+    }
+
+    pub fn restore_trace(&self, trace_id: &str) -> Result<TracePaths> {
+        fs::create_dir_all(&self.config.root).with_context(|| {
+            format!("failed to create trace root {}", self.config.root.display())
+        })?;
+
+        let active = self.paths_for(trace_id);
+        let archived = self.archived_paths_for(trace_id);
+        let state = self.trace_state(trace_id);
+
+        match (state.active, state.archived) {
+            (false, false) => bail!("trace is not archived: {trace_id}"),
+            (true, false) => bail!("trace is not archived: {trace_id}"),
+            (true, true) => bail!(
+                "active destination already exists: {}",
+                active.root.display()
+            ),
+            (false, true) => {
+                fs::rename(&archived.root, &active.root).with_context(|| {
+                    format!(
+                        "failed to move trace {} to {}",
+                        archived.root.display(),
+                        active.root.display()
+                    )
+                })?;
+
+                Ok(active)
+            }
+        }
     }
 
     /// Open an artifact file with create-new semantics.
@@ -147,7 +271,10 @@ impl FilesystemTraceStore {
 
     pub fn load_manifest(&self, trace_id: &str) -> Result<TraceManifest> {
         let paths = self.paths_for(trace_id);
+        self.load_manifest_at(&paths)
+    }
 
+    pub fn load_manifest_at(&self, paths: &TracePaths) -> Result<TraceManifest> {
         let json = fs::read_to_string(&paths.manifest)
             .with_context(|| format!("failed to read {}", paths.manifest.display()))?;
 
@@ -164,4 +291,10 @@ impl FilesystemTraceStore {
     pub fn artifact_hash(path: &Path) -> Result<String> {
         sha256_file(path)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TraceState {
+    pub active: bool,
+    pub archived: bool,
 }
