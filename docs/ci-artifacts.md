@@ -20,6 +20,17 @@ Minimal GitHub Actions pattern:
   with:
     name: tracebox-ci-evidence
     path: .traces/
+    include-hidden-files: true
+    if-no-files-found: ignore
+
+Because `.traces/` is a hidden directory, `actions/upload-artifact` needs `include-hidden-files: true`.
+
+- name: Upload Tracebox evidence
+  if: always()
+  uses: actions/upload-artifact@v4
+  with:
+    name: tracebox-ci-evidence
+    path: .traces/
     if-no-files-found: ignore
 ```
 
