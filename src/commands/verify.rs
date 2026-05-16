@@ -21,41 +21,76 @@ use crate::evidence::store::{FilesystemTraceStore, TraceStoreConfig};
 /// - `2`: trace is missing or structurally invalid.
 pub fn execute(trace_root: PathBuf, trace_id: String, json_output: bool) -> Result<i32> {
     let store = FilesystemTraceStore::new(TraceStoreConfig::new(&trace_root));
-    let resolved = store.resolve_trace(&trace_id)?;
+    let verification = match collect_verification(&store, &trace_id) {
+        Ok(verification) => verification,
+        Err(error) => {
+            let paths = store.paths_for(&trace_id);
+            return finish_invalid(json_output, &trace_id, &paths.root, &format!("{error}"));
+        }
+    };
+
+    let all_ok = verification.all_ok();
+
+    if json_output {
+        let report = VerificationReport {
+            trace_id,
+            trace_path: verification.trace_path.clone(),
+            status: if all_ok { "OK" } else { "FAILED" },
+            reason: if all_ok {
+                None
+            } else {
+                verification.first_failure_reason()
+            },
+            checks: verification
+                .checks
+                .iter()
+                .map(VerificationCheck::to_json)
+                .collect(),
+        };
+
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("Trace ID: {}", verification.trace_id);
+        println!("Trace path: {}", verification.trace_path);
+        if all_ok {
+            println!("Status: OK");
+        } else {
+            println!("Status: FAILED");
+            if let Some(reason) = verification.first_failure_reason() {
+                println!("Reason: {reason}");
+            }
+        }
+        println!();
+        println!("Checks:");
+        for check in &verification.checks {
+            print_check(check);
+        }
+    }
+
+    if all_ok {
+        Ok(0)
+    } else {
+        Ok(1)
+    }
+}
+
+pub(crate) fn collect_verification(
+    store: &FilesystemTraceStore,
+    trace_id: &str,
+) -> Result<VerificationSummary> {
+    let resolved = store.resolve_trace(trace_id)?;
     let paths = resolved.paths;
 
     if !paths.root.is_dir() {
-        return finish_invalid(
-            json_output,
-            &trace_id,
-            &paths.root,
-            "trace directory does not exist",
-        );
+        anyhow::bail!("trace directory does not exist");
     }
 
-    let manifest_json = match fs::read_to_string(&paths.manifest) {
-        Ok(json) => json,
-        Err(error) => {
-            return finish_invalid(
-                json_output,
-                &trace_id,
-                &paths.root,
-                &format!("failed to read {}: {error}", paths.manifest.display()),
-            );
-        }
-    };
+    let manifest_json = fs::read_to_string(&paths.manifest)
+        .map_err(|error| anyhow::anyhow!("failed to read {}: {error}", paths.manifest.display()))?;
 
-    let manifest: TraceManifest = match serde_json::from_str(&manifest_json) {
-        Ok(manifest) => manifest,
-        Err(error) => {
-            return finish_invalid(
-                json_output,
-                &trace_id,
-                &paths.root,
-                &format!("failed to parse {}: {error}", paths.manifest.display()),
-            );
-        }
-    };
+    let manifest: TraceManifest = serde_json::from_str(&manifest_json).map_err(|error| {
+        anyhow::anyhow!("failed to parse {}: {error}", paths.manifest.display())
+    })?;
 
     let mut checks = Vec::new();
 
@@ -79,41 +114,11 @@ pub fn execute(trace_root: PathBuf, trace_id: String, json_output: bool) -> Resu
 
     verify_optional_pty(&mut checks, &paths.root, &manifest);
 
-    let all_ok = checks.iter().all(VerificationCheck::is_ok);
-
-    if json_output {
-        let report = VerificationReport {
-            trace_id,
-            trace_path: paths.root.display().to_string(),
-            status: if all_ok { "OK" } else { "FAILED" },
-            reason: None,
-            checks: checks.iter().map(VerificationCheck::to_json).collect(),
-        };
-
-        println!("{}", serde_json::to_string_pretty(&report)?);
-    } else {
-        println!("Trace ID: {trace_id}");
-        println!("Trace path: {}", paths.root.display());
-
-        if all_ok {
-            println!("Status: OK");
-        } else {
-            println!("Status: FAILED");
-        }
-
-        println!();
-        println!("Checks:");
-
-        for check in &checks {
-            print_check(check);
-        }
-    }
-
-    if all_ok {
-        Ok(0)
-    } else {
-        Ok(1)
-    }
+    Ok(VerificationSummary {
+        trace_id: trace_id.to_string(),
+        trace_path: paths.root.display().to_string(),
+        checks,
+    })
 }
 
 #[derive(Debug, Serialize)]
@@ -133,6 +138,67 @@ struct JsonVerificationCheck {
     expected: Option<String>,
     actual: Option<String>,
     detail: Option<String>,
+}
+
+#[derive(Debug)]
+pub(crate) struct VerificationSummary {
+    trace_id: String,
+    trace_path: String,
+    checks: Vec<VerificationCheck>,
+}
+
+impl VerificationSummary {
+    pub(crate) fn all_ok(&self) -> bool {
+        self.checks.iter().all(VerificationCheck::is_ok)
+    }
+
+    pub(crate) fn first_failure_reason(&self) -> Option<String> {
+        self.checks
+            .iter()
+            .find(|check| !check.is_ok())
+            .map(verification_check_reason)
+    }
+}
+
+#[cfg(feature = "tui")]
+impl VerificationSummary {
+    pub(crate) fn status(&self) -> &'static str {
+        if self.all_ok() {
+            "OK"
+        } else {
+            "FAILED"
+        }
+    }
+
+    pub(crate) fn render_text(&self) -> String {
+        let mut output = String::new();
+        output.push_str(&format!("Trace ID: {}\n", self.trace_id));
+        output.push_str(&format!("Trace path: {}\n", self.trace_path));
+        output.push_str(&format!("Status: {}\n\n", self.status()));
+        output.push_str("Checks:\n");
+
+        for check in &self.checks {
+            output.push_str(&format!("  {}: {}\n", check.label, check.status.as_str()));
+
+            if let Some(path) = &check.path {
+                output.push_str(&format!("    path: {}\n", path.display()));
+            }
+
+            if let Some(expected) = &check.expected {
+                output.push_str(&format!("    expected: {expected}\n"));
+            }
+
+            if let Some(actual) = &check.actual {
+                output.push_str(&format!("    actual:   {actual}\n"));
+            }
+
+            if let Some(detail) = &check.detail {
+                output.push_str(&format!("    detail:   {detail}\n"));
+            }
+        }
+
+        output
+    }
 }
 
 #[derive(Debug)]
@@ -419,5 +485,38 @@ fn print_check(check: &VerificationCheck) {
 
     if let Some(detail) = &check.detail {
         println!("    detail:   {detail}");
+    }
+}
+
+fn verification_check_reason(check: &VerificationCheck) -> String {
+    match check.status {
+        CheckStatus::Ok => "verification passed".to_string(),
+        CheckStatus::Failed => check
+            .detail
+            .clone()
+            .or_else(|| {
+                Some(match (&check.expected, &check.actual) {
+                    (Some(expected), Some(actual)) => {
+                        format!(
+                            "{} mismatch (expected {expected}, actual {actual})",
+                            check.label
+                        )
+                    }
+                    _ => format!("{} failed verification", check.label),
+                })
+            })
+            .unwrap(),
+        CheckStatus::Missing => {
+            let path = check
+                .path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| check.label.clone());
+            format!("{path} missing")
+        }
+        CheckStatus::Invalid => check
+            .detail
+            .clone()
+            .unwrap_or_else(|| format!("{} is invalid", check.label)),
     }
 }
