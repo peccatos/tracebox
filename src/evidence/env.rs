@@ -22,6 +22,7 @@ const ENV_ALLOWLIST: &[&str] = &[
     "HOME",
     "LANG",
     "LC_ALL",
+    "TRACEBOX_MODE",
     "RUSTUP_TOOLCHAIN",
     "CARGO_HOME",
     "RUST_BACKTRACE",
@@ -41,4 +42,32 @@ pub fn collect_env() -> Vec<EnvVar> {
     // Stable ordering helps future diffing and hashing.
     vars.sort_by(|a, b| a.key.cmp(&b.key));
     vars
+}
+
+#[cfg(test)]
+mod tests {
+    use super::collect_env;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn captures_tracebox_mode_when_allowed() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let previous = std::env::var("TRACEBOX_MODE").ok();
+
+        std::env::set_var("TRACEBOX_MODE", "stable");
+        let env = collect_env();
+        let captured = env
+            .iter()
+            .find(|item| item.key == "TRACEBOX_MODE")
+            .map(|item| item.value.as_str());
+
+        assert_eq!(captured, Some("stable"));
+
+        match previous {
+            Some(value) => std::env::set_var("TRACEBOX_MODE", value),
+            None => std::env::remove_var("TRACEBOX_MODE"),
+        }
+    }
 }

@@ -798,6 +798,45 @@ fn inspect_verify_and_diff_support_json_output() -> Result<()> {
 }
 
 #[test]
+fn diff_reports_environment_changes_when_tracebox_mode_differs() -> Result<()> {
+    let temp = TempDir::new()?;
+
+    let mut first = Command::cargo_bin("tracebox")?;
+    first
+        .current_dir(temp.path())
+        .env("TRACEBOX_MODE", "stable")
+        .args(["run", "--", "sh", "-c", "printf first"]);
+    first.assert().success();
+
+    let mut second = Command::cargo_bin("tracebox")?;
+    second
+        .current_dir(temp.path())
+        .env("TRACEBOX_MODE", "broken")
+        .args(["run", "--", "sh", "-c", "printf second && exit 3"]);
+    second.assert().code(3);
+
+    let trace_ids = trace_ids_from_list_json(temp.path(), false, false)?;
+    assert_eq!(trace_ids.len(), 2);
+
+    let first_trace = &trace_ids[0];
+    let second_trace = &trace_ids[1];
+
+    let diff_output = Command::cargo_bin("tracebox")?
+        .current_dir(temp.path())
+        .args(["diff", first_trace, second_trace, "--json"])
+        .output()?;
+
+    assert!(diff_output.status.success());
+
+    let diff_json: Value = serde_json::from_slice(&diff_output.stdout)?;
+    assert_eq!(diff_json["environment"]["changed"], true);
+    assert_eq!(diff_json["environment"]["left"]["TRACEBOX_MODE"], "stable");
+    assert_eq!(diff_json["environment"]["right"]["TRACEBOX_MODE"], "broken");
+
+    Ok(())
+}
+
+#[test]
 fn validate_accepts_valid_trace_and_rejects_semantically_invalid_manifest() -> Result<()> {
     let temp = TempDir::new()?;
 

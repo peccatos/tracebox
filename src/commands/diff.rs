@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -48,6 +48,11 @@ pub fn execute(trace_root: PathBuf, left: String, right: String, json_output: bo
     );
 
     print_field_diff("cwd", &left_manifest.cwd, &right_manifest.cwd);
+
+    println!();
+    println!("Environment:");
+
+    diff_env(&left_manifest.env, &right_manifest.env);
 
     println!();
     println!("Git:");
@@ -128,6 +133,7 @@ fn json_diff(left: &TraceManifest, right: &TraceManifest) -> Value {
             "commit_after": value_diff(&left.git.commit_after, &right.git.commit_after),
             "dirty_after": value_diff(left.git.dirty_after, right.git.dirty_after),
         },
+        "environment": value_diff(env_map(&left.env), env_map(&right.env)),
         "workspace": {
             "created": file_set_diff(
                 &left.workspace.changes.created_files,
@@ -194,6 +200,12 @@ fn display_opt(value: &Option<String>) -> String {
     value.as_deref().unwrap_or("-").to_string()
 }
 
+fn env_map(env: &[crate::evidence::manifest::EnvVar]) -> BTreeMap<String, String> {
+    env.iter()
+        .map(|item| (item.key.clone(), item.value.clone()))
+        .collect()
+}
+
 fn print_field_diff(label: &str, left: &str, right: &str) {
     if left == right {
         println!("{label}: {left}");
@@ -226,6 +238,45 @@ fn diff_file_set(label: &str, left: &[String], right: &[String]) {
         for file in diff.only_right {
             println!("      - {file}");
         }
+    }
+}
+
+fn diff_env(
+    left: &[crate::evidence::manifest::EnvVar],
+    right: &[crate::evidence::manifest::EnvVar],
+) {
+    let left = env_map(left);
+    let right = env_map(right);
+    let keys = left
+        .keys()
+        .chain(right.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+
+    let mut changed = false;
+
+    for key in keys {
+        let left_value = left.get(&key);
+        let right_value = right.get(&key);
+
+        if left_value == right_value {
+            continue;
+        }
+
+        changed = true;
+        println!("  {key}:");
+        println!(
+            "    left: {}",
+            left_value.map(String::as_str).unwrap_or("-")
+        );
+        println!(
+            "    right: {}",
+            right_value.map(String::as_str).unwrap_or("-")
+        );
+    }
+
+    if !changed {
+        println!("  same");
     }
 }
 
