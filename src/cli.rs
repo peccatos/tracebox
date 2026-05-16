@@ -94,6 +94,18 @@ pub enum Commands {
         json: bool,
     },
 
+    /// Generate a markdown report for a trace.
+    Report {
+        /// Trace ID, for example `trc_019...`.
+        trace_id: String,
+
+        /// Optional report output path.
+        ///
+        /// Defaults to `.traces/<trace-id>/report.md`.
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+
     /// Compare two traces.
     Diff {
         /// Left/base trace ID.

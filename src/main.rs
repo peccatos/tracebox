@@ -52,6 +52,10 @@ fn main() -> Result<()> {
             tracebox::commands::list::execute(cli.trace_root, json)?;
         }
 
+        Commands::Report { trace_id, output } => {
+            tracebox::commands::report::execute(cli.trace_root, trace_id, output)?;
+        }
+
         Commands::Diff { left, right, json } => {
             tracebox::commands::diff::execute(cli.trace_root, left, right, json)?;
         }
