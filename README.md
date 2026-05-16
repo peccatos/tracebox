@@ -127,6 +127,26 @@ The trace is still written even when the wrapped command fails.
 
 ---
 
+## Demo: CI/local environment drift
+
+Tracebox can capture two command executions and compare why one passed while the other failed.
+
+```bash
+cargo build
+
+cd examples/env-drift
+TRACEBOX_MODE=stable ../../target/debug/tracebox run -- cargo test
+TRACEBOX_MODE=broken ../../target/debug/tracebox run -- cargo test
+
+../../target/debug/tracebox list
+../../target/debug/tracebox diff <passed-trace-id> <failed-trace-id>
+../../target/debug/tracebox report <failed-trace-id>
+```
+
+See the full walkthrough in [docs/demo.md](docs/demo.md) and the example crate in [examples/env-drift](examples/env-drift).
+
+---
+
 ## Inspect a trace
 
 ```bash
