@@ -1,13 +1,13 @@
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 
 use crate::commands::report;
+use crate::commands::verify::collect_verification;
 use crate::evidence::browser::{load_trace_catalog, TraceCatalog, TraceSummary, TraceTab};
-use crate::evidence::integrity::sha256_file;
 use crate::evidence::store::{FilesystemTraceStore, TraceStoreConfig};
 
 #[cfg(feature = "tui")]
@@ -56,20 +56,6 @@ pub struct TraceBrowserState {
 enum DetailView {
     Help,
     Text(String),
-}
-
-#[derive(Debug, Clone)]
-struct VerificationResult {
-    ok: bool,
-    text: String,
-    failure_reason: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-struct ArtifactVerification {
-    ok: bool,
-    rendered: String,
-    reason: Option<String>,
 }
 
 impl TraceBrowserState {
@@ -197,26 +183,19 @@ impl TraceBrowserState {
             .selected_trace()
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("no trace selected"))?;
-        match build_verify_text(&self.trace_root, &summary) {
-            Ok(result) => {
-                self.detail = DetailView::Text(result.text);
-                self.status = if result.ok {
-                    "Verification: OK".to_string()
-                } else {
-                    format!(
-                        "Verification failed: {}",
-                        result
-                            .failure_reason
-                            .unwrap_or_else(|| "verification failed".to_string())
-                    )
-                };
-            }
-            Err(err) => {
-                self.detail = DetailView::Text(format!("Verification failed: {err}"));
-                self.status = format!("Error: {err}");
-                return Err(err);
-            }
-        }
+        let store = FilesystemTraceStore::new(TraceStoreConfig::new(&self.trace_root));
+        let verification = collect_verification(&store, &summary.trace_id)?;
+        self.detail = DetailView::Text(verification.render_text());
+        self.status = if verification.all_ok() {
+            "Verification: OK".to_string()
+        } else {
+            format!(
+                "Verification failed: {}",
+                verification
+                    .first_failure_reason()
+                    .unwrap_or_else(|| "verification failed".to_string())
+            )
+        };
         Ok(())
     }
 
@@ -554,104 +533,6 @@ fn build_summary_text(trace: &TraceSummary) -> String {
     )
 }
 
-fn build_verify_text(trace_root: &PathBuf, trace: &TraceSummary) -> Result<VerificationResult> {
-    let store = FilesystemTraceStore::new(TraceStoreConfig::new(trace_root));
-    let resolved = store.resolve_trace(&trace.trace_id)?;
-    let manifest = store.load_manifest_at(&resolved.paths)?;
-    let mut lines = Vec::new();
-    let mut ok = true;
-    let mut failure_reason = None;
-
-    lines.push(format!("Trace ID: {}", trace.trace_id));
-    lines.push(format!("Trace path: {}", resolved.paths.root.display()));
-
-    let manifest_hash = manifest_sha256_status(&resolved.paths)?;
-    lines.push(format!(
-        "Manifest: {}",
-        manifest_hash
-            .clone()
-            .unwrap_or_else(|| "unavailable".to_string())
-    ));
-    if matches!(manifest_hash.as_deref(), Some(text) if text.starts_with("FAILED")) {
-        ok = false;
-        failure_reason = Some("manifest checksum mismatch".to_string());
-    }
-
-    let stdout_hash = verify_artifact(&resolved.paths.stdout, &manifest.integrity.stdout_sha256)?;
-    if !stdout_hash.ok {
-        ok = false;
-        failure_reason.get_or_insert(
-            stdout_hash
-                .reason
-                .clone()
-                .unwrap_or_else(|| "stdout hash mismatch".to_string()),
-        );
-    }
-    let stderr_hash = verify_artifact(&resolved.paths.stderr, &manifest.integrity.stderr_sha256)?;
-    if !stderr_hash.ok {
-        ok = false;
-        failure_reason.get_or_insert(
-            stderr_hash
-                .reason
-                .clone()
-                .unwrap_or_else(|| "stderr hash mismatch".to_string()),
-        );
-    }
-
-    lines.push(format!("stdout: {}", stdout_hash.rendered));
-    lines.push(format!("stderr: {}", stderr_hash.rendered));
-
-    lines.push(format!("Status: {}", if ok { "OK" } else { "FAILED" }));
-
-    Ok(VerificationResult {
-        ok,
-        text: lines.join("\n"),
-        failure_reason,
-    })
-}
-
-fn manifest_sha256_status(paths: &crate::evidence::store::TracePaths) -> Result<Option<String>> {
-    if !paths.manifest_sha256.exists() {
-        return Ok(None);
-    }
-
-    let expected = fs::read_to_string(&paths.manifest_sha256)
-        .with_context(|| format!("failed to read {}", paths.manifest_sha256.display()))?
-        .trim()
-        .to_string();
-
-    if expected.is_empty() {
-        return Ok(Some("FAILED (empty manifest.sha256)".to_string()));
-    }
-
-    let actual = sha256_file(&paths.manifest)?;
-
-    if actual == expected {
-        Ok(Some("OK".to_string()))
-    } else {
-        Ok(Some(format!(
-            "FAILED (expected {expected}, actual {actual})"
-        )))
-    }
-}
-
-fn verify_artifact(path: &Path, expected: &str) -> Result<ArtifactVerification> {
-    let actual = sha256_file(path)?;
-    if actual == expected {
-        Ok(ArtifactVerification {
-            ok: true,
-            rendered: "OK".to_string(),
-            reason: None,
-        })
-    } else {
-        Ok(ArtifactVerification {
-            ok: false,
-            rendered: format!("FAILED (expected {expected}, actual {actual})"),
-            reason: Some(format!("{} hash mismatch", path.display())),
-        })
-    }
-}
-
 impl TraceBrowserState {
     fn status_line(&self) -> String {
         if self.status.is_empty() {
@@ -675,14 +556,25 @@ impl TraceBrowserState {
 #[cfg(all(test, feature = "tui"))]
 mod tests {
     use super::*;
+    use crate::commands::verify::collect_verification;
+    use crate::evidence::integrity::sha256_file;
+    use crate::evidence::store::{FilesystemTraceStore, TraceStoreConfig};
     use serde_json::json;
     use std::fs;
     use tempfile::TempDir;
+
+    #[derive(Clone, Copy)]
+    enum PtyFixture {
+        None,
+        Mismatch,
+    }
 
     fn create_trace(
         workspace: &std::path::Path,
         trace_id: &str,
         archived: bool,
+        manifest_sidecar: bool,
+        pty_fixture: PtyFixture,
     ) -> Result<PathBuf> {
         let root = if archived {
             workspace.join(".traces/archive").join(trace_id)
@@ -690,6 +582,21 @@ mod tests {
             workspace.join(".traces").join(trace_id)
         };
         fs::create_dir_all(&root)?;
+
+        let (pty_path, pty_sha256) = match pty_fixture {
+            PtyFixture::None => (serde_json::Value::Null, serde_json::Value::Null),
+            PtyFixture::Mismatch => {
+                fs::write(root.join("pty.log"), "pty\n")?;
+                (
+                    serde_json::Value::String("pty.log".to_string()),
+                    serde_json::Value::String(
+                        "0000000000000000000000000000000000000000000000000000000000000000"
+                            .to_string(),
+                    ),
+                )
+            }
+        };
+
         let manifest = json!({
             "manifest_version": 1,
             "trace_id": trace_id,
@@ -704,12 +611,12 @@ mod tests {
             "artifacts": {
                 "stdout": "stdout.log",
                 "stderr": "stderr.log",
-                "pty": null,
+                "pty": pty_path,
             },
             "integrity": {
                 "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
                 "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-                "pty_sha256": null,
+                "pty_sha256": pty_sha256,
             },
             "git": {
                 "commit_before": null,
@@ -737,8 +644,10 @@ mod tests {
         )?;
         fs::write(root.join("stdout.log"), "")?;
         fs::write(root.join("stderr.log"), "")?;
-        let manifest_hash = sha256_file(&root.join("manifest.json"))?;
-        fs::write(root.join("manifest.sha256"), format!("{manifest_hash}\n"))?;
+        if manifest_sidecar {
+            let manifest_hash = sha256_file(&root.join("manifest.json"))?;
+            fs::write(root.join("manifest.sha256"), format!("{manifest_hash}\n"))?;
+        }
         Ok(root)
     }
 
@@ -748,8 +657,8 @@ mod tests {
         fs::create_dir_all(temp.path().join(".traces/archive"))?;
         fs::create_dir_all(temp.path().join(".traces/reports"))?;
 
-        let active = create_trace(temp.path(), "trc_active", false)?;
-        let archived = create_trace(temp.path(), "trc_archived", true)?;
+        let active = create_trace(temp.path(), "trc_active", false, true, PtyFixture::None)?;
+        let archived = create_trace(temp.path(), "trc_archived", true, true, PtyFixture::None)?;
 
         let catalog = load_trace_catalog(&temp.path().join(".traces"))?;
         assert_eq!(catalog.active.len(), 1);
@@ -903,7 +812,7 @@ mod tests {
         let temp = TempDir::new()?;
         let root = temp.path().join(".traces");
         fs::create_dir_all(&root)?;
-        let _ = create_trace(temp.path(), "trc_alpha", false)?;
+        let _ = create_trace(temp.path(), "trc_alpha", false, true, PtyFixture::None)?;
 
         let mut state = TraceBrowserState::load(root)?;
         state.set_filter("does-not-match");
@@ -925,7 +834,7 @@ mod tests {
         let temp = TempDir::new()?;
         let root = temp.path().join(".traces");
         fs::create_dir_all(&root)?;
-        let _ = create_trace(temp.path(), "trc_detail", false)?;
+        let _ = create_trace(temp.path(), "trc_detail", false, true, PtyFixture::None)?;
 
         let state = TraceBrowserState::load(root)?;
         let mut state = state;
@@ -942,7 +851,7 @@ mod tests {
     fn report_verify_archive_and_restore_set_status_messages() -> Result<()> {
         let temp = TempDir::new()?;
         let root = temp.path().to_path_buf();
-        let _trace_path = create_trace(temp.path(), "trc_action", false)?;
+        let _trace_path = create_trace(temp.path(), "trc_action", false, true, PtyFixture::None)?;
         let mut state = TraceBrowserState::load(root.join(".traces"))?;
 
         state.report_selected()?;
@@ -975,6 +884,87 @@ mod tests {
     }
 
     #[test]
+    fn verify_selected_fails_without_manifest_sidecar() -> Result<()> {
+        let temp = TempDir::new()?;
+        let root = temp.path().to_path_buf();
+        let _ = create_trace(
+            temp.path(),
+            "trc_missing_sidecar",
+            false,
+            false,
+            PtyFixture::None,
+        )?;
+        let mut state = TraceBrowserState::load(root.join(".traces"))?;
+
+        state.verify_selected()?;
+        assert!(state.status().starts_with("Verification failed:"));
+        assert!(state.detail_text().unwrap_or("").contains("Status: FAILED"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn verify_selected_fails_when_manifest_sha256_does_not_match() -> Result<()> {
+        let temp = TempDir::new()?;
+        let root = temp.path().to_path_buf();
+        let trace_path = create_trace(
+            temp.path(),
+            "trc_bad_sidecar",
+            false,
+            true,
+            PtyFixture::None,
+        )?;
+        fs::write(trace_path.join("manifest.sha256"), "deadbeef\n")?;
+
+        let mut state = TraceBrowserState::load(root.join(".traces"))?;
+        state.verify_selected()?;
+
+        assert!(state.status().starts_with("Verification failed:"));
+        assert!(state.detail_text().unwrap_or("").contains("Status: FAILED"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn verify_selected_fails_for_optional_pty_mismatch() -> Result<()> {
+        let temp = TempDir::new()?;
+        let root = temp.path().to_path_buf();
+        let _ = create_trace(
+            temp.path(),
+            "trc_bad_pty",
+            false,
+            true,
+            PtyFixture::Mismatch,
+        )?;
+
+        let mut state = TraceBrowserState::load(root.join(".traces"))?;
+        state.verify_selected()?;
+
+        assert!(state.status().starts_with("Verification failed:"));
+        assert!(state.detail_text().unwrap_or("").contains("pty.log"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn verify_selected_matches_cli_verifier_for_intact_trace() -> Result<()> {
+        let temp = TempDir::new()?;
+        let root = temp.path().to_path_buf();
+        let _ = create_trace(temp.path(), "trc_intact", false, true, PtyFixture::None)?;
+        let mut state = TraceBrowserState::load(root.join(".traces"))?;
+
+        let store = FilesystemTraceStore::new(TraceStoreConfig::new(root.join(".traces")));
+        let cli_result = collect_verification(&store, "trc_intact")?;
+        assert!(cli_result.all_ok());
+
+        state.verify_selected()?;
+        assert_eq!(state.status(), "Verification: OK");
+        assert!(state.detail_text().unwrap_or("").contains("Status: OK"));
+
+        Ok(())
+    }
+
+    #[test]
     fn missing_traces_directory_does_not_panic() -> Result<()> {
         let temp = TempDir::new()?;
         let catalog = load_trace_catalog(&temp.path().join(".traces"))?;
@@ -986,7 +976,7 @@ mod tests {
     fn archive_and_restore_actions_delegate_to_store_logic() -> Result<()> {
         let temp = TempDir::new()?;
         let root = temp.path().to_path_buf();
-        let trace_path = create_trace(temp.path(), "trc_action", false)?;
+        let trace_path = create_trace(temp.path(), "trc_action", false, true, PtyFixture::None)?;
         let mut state = TraceBrowserState::load(root.join(".traces"))?;
 
         assert_eq!(state.visible_traces().len(), 1);

@@ -389,12 +389,19 @@ fn service_directories_are_never_treated_as_traces() -> Result<()> {
         vec!["report", "archive"],
         vec!["diff", "archive", &active_trace],
     ] {
-        Command::cargo_bin("tracebox")?
+        let command_name = args[0];
+        let mut command = Command::cargo_bin("tracebox")?;
+        let assert = command
             .current_dir(temp.path())
             .args(args)
             .assert()
-            .failure()
-            .stderr(predicate::str::contains("trace not found"));
+            .failure();
+
+        if command_name == "verify" {
+            assert.stdout(predicate::str::contains("trace not found"));
+        } else {
+            assert.stderr(predicate::str::contains("trace not found"));
+        }
     }
 
     Command::cargo_bin("tracebox")?
