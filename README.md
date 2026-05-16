@@ -1,37 +1,119 @@
 # Tracebox
 
-Tracebox is a Linux-native immutable execution evidence runtime.
+Tracebox captures execution evidence for commands and helps diagnose CI/local drift, flaky tests, and environment-dependent failures.
 
-It records deterministic evidence about process executions so failed runs, retries,
-workspace mutations, and flaky behavior can be inspected later.
+It records what happened around a command so you can compare runs instead of guessing why behavior changed.
 
-Tracebox does **not** attempt full deterministic execution replay.
+---
 
-The core idea is:
+## Problem
 
-```text
-execution replay is often impossible
-evidence replay is possible
+Tracebox helps answer questions like:
+
+- Why did this pass locally but fail in CI?
+- Why did this flaky test fail this time?
+- What changed between two command executions?
+- Which env/git/workspace/artifact differences affected the run?
+
+---
+
+## Quickstart
+
+```bash
+cargo build
+cargo run -- run -- echo hello
+cargo run -- list
+cargo run -- inspect <trace-id>
+cargo run -- report <trace-id>
 ```
 
-Tracebox focuses on:
+Tracebox preserves the wrapped command exit code and writes an immutable trace bundle under `.traces/`.
 
-- command execution evidence;
-- immutable trace bundles;
-- stdout/stderr artifacts;
-- git and workspace state;
-- trace inspection;
-- trace diffing;
-- artifact integrity verification;
-- machine-readable JSON output for automation.
+---
 
-It is not:
+## Core Commands
 
-- a terminal video recorder;
-- a screen recorder;
-- a chat transcript viewer;
-- a full deterministic replay system;
-- an AI observability dashboard.
+- `run` captures a command and its evidence.
+- `list` shows stored traces.
+- `inspect` prints a trace summary and evidence tails.
+- `verify` checks recorded artifact integrity.
+- `validate` checks trace structure and semantic consistency.
+- `diff` compares two traces.
+- `report` writes a Markdown report for a trace.
+- `archive` moves a trace into the archived area.
+- `restore` moves an archived trace back to active storage.
+- `tui` opens the feature-gated browser with `cargo run --features tui -- tui`.
+
+---
+
+## Env Drift Demo
+
+See [examples/env-drift/](examples/env-drift/) and [docs/demo.md](docs/demo.md).
+
+```bash
+cd examples/env-drift
+TRACEBOX_MODE=stable ../../target/debug/tracebox run -- cargo test
+TRACEBOX_MODE=broken ../../target/debug/tracebox run -- cargo test
+
+../../target/debug/tracebox diff <passed-trace-id> <failed-trace-id>
+../../target/debug/tracebox report <failed-trace-id>
+```
+
+Expected result:
+
+- stable run passes
+- broken run fails
+- diff shows `TRACEBOX_MODE: stable -> broken`
+- report preserves stdout/stderr/manifest evidence
+
+---
+
+## TUI
+
+```bash
+cargo run --features tui -- tui
+```
+
+The TUI is optional behind the `tui` feature. It provides active and archived views, filtering, report/verify/archive/restore actions, and does not execute commands.
+
+---
+
+## CI Artifacts
+
+```yaml
+- name: Test with Tracebox
+  run: tracebox run -- cargo test
+
+- name: Upload Tracebox evidence
+  if: always()
+  uses: actions/upload-artifact@v4
+  with:
+    name: tracebox-evidence
+    path: .traces/
+```
+
+---
+
+## Safety / Non-Goals
+
+Tracebox v0.1 alpha does not implement:
+
+- syscall replay;
+- ptrace engine;
+- eBPF tracing;
+- sandboxing;
+- distributed tracing;
+- AI diagnosis;
+- process isolation;
+- network capture.
+
+---
+
+## Alpha Status
+
+Tracebox is currently alpha software.
+The trace format and CLI may still change.
+Use it for local/dev/CI evidence capture, not as a security boundary.
 
 ---
 
@@ -86,64 +168,6 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test --locked
 ```
-
----
-
-## Basic usage
-
-Run a command and capture evidence:
-
-```bash
-tracebox run -- cargo test
-```
-
-This creates an immutable trace bundle under `.traces/`:
-
-```text
-.traces/
-└── trc_<uuidv7>/
-    ├── manifest.json
-    ├── manifest.sha256
-    ├── stdout.log
-    └── stderr.log
-```
-
-Tracebox preserves the wrapped command exit code.
-
-For example:
-
-```bash
-tracebox run -- sh -c 'echo ok && echo err >&2 && exit 7'
-echo $?
-```
-
-Expected:
-
-```text
-7
-```
-
-The trace is still written even when the wrapped command fails.
-
----
-
-## Demo: CI/local environment drift
-
-Tracebox can capture two command executions and compare why one passed while the other failed.
-
-```bash
-cargo build
-
-cd examples/env-drift
-TRACEBOX_MODE=stable ../../target/debug/tracebox run -- cargo test
-TRACEBOX_MODE=broken ../../target/debug/tracebox run -- cargo test
-
-../../target/debug/tracebox list
-../../target/debug/tracebox diff <passed-trace-id> <failed-trace-id>
-../../target/debug/tracebox report <failed-trace-id>
-```
-
-See the full walkthrough in [docs/demo.md](docs/demo.md) and the example crate in [examples/env-drift](examples/env-drift).
 
 ---
 
